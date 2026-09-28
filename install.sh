@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installerar raw-backup som en LaunchAgent som startar när en volym monteras.
+# Installs raw-backup as a LaunchAgent that runs whenever a drive is mounted.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -9,19 +9,44 @@ SCRIPT="$SCRIPT_DIR/raw-backup.sh"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONF="$HOME/.config/raw-backup.conf"
 
-[ "$(uname)" = "Darwin" ] || { echo "Det här fungerar bara på macOS."; exit 1; }
+[ "$(uname)" = "Darwin" ] || { echo "This only works on macOS."; exit 1; }
 
 mkdir -p "$SCRIPT_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs" "$HOME/.config"
 install -m 755 raw-backup.sh "$SCRIPT"
-echo "✓ Skript installerat: $SCRIPT"
+echo "✓ Script installed: $SCRIPT"
 
-if [ ! -f "$CONF" ]; then
-    cp raw-backup.conf.example "$CONF"
-    echo "✓ Inställningar skapade: $CONF"
+# ---- Config: ask for the first job if there is no config yet
+write_conf() {  # $1 = job line
+    awk -v job="$1" -v q="'" '
+        index($0, "JOBS=" q) == 1 { print; print job; skip = 1; next }
+        skip && substr($0, 1, 1) == q { skip = 0 }
+        skip && /^#/ { print; next }
+        skip { next }
+        { print }' raw-backup.conf.example > "$CONF"
+}
+
+if [ -f "$CONF" ]; then
+    echo "• Keeping existing config: $CONF"
+elif [ -t 0 ]; then
+    echo
+    echo "Set up your first backup job (you can add more later in $CONF)."
+    read -r -p "Folder to back up [~/Pictures]: " src
+    src="${src:-~/Pictures}"
+    echo "Drives currently connected:"
+    ls /Volumes | grep -v '^Macintosh HD' | sed 's/^/    /' || true
+    read -r -p "Drive name (as shown in Finder): " vol
+    while [ -z "$vol" ]; do read -r -p "Drive name: " vol; done
+    src_expanded="${src/#\~/$HOME}"
+    read -r -p "Folder on the drive [$(basename "$src_expanded")]: " dir
+    dir="${dir:-$(basename "$src_expanded")}"
+    write_conf "$src | $vol | $dir"
+    echo "✓ Config created: $CONF"
 else
-    echo "• Behåller befintliga inställningar: $CONF"
+    cp raw-backup.conf.example "$CONF"
+    echo "✓ Config created from example: $CONF  (edit JOBS before use)"
 fi
 
+# ---- LaunchAgent
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -46,7 +71,12 @@ EOF
 
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "✓ LaunchAgent aktiv: $LABEL"
+echo "✓ LaunchAgent active: $LABEL"
 echo
-echo "Klart. Sätt i USB-minnet så startar backupen. Logg: ~/Library/Logs/raw-backup.log"
-echo "Testa manuellt:  $SCRIPT --dry-run"
+bash "$SCRIPT" --list || true
+echo
+echo "Done. Plug in a drive and its jobs start automatically. Log: ~/Library/Logs/raw-backup.log"
+echo "Try it first without copying anything:  bash $SCRIPT --dry-run"
+echo
+echo "IMPORTANT: give /bin/bash Full Disk Access, or macOS will block the background run."
+echo "System Settings > Privacy & Security > Full Disk Access > + > Cmd+Shift+G > /bin/bash"

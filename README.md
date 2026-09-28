@@ -1,85 +1,109 @@
 # raw-backup
 
-Automatisk backup av `~/WORK/Raw` till ett USB-minne (`USB_1TB`) på macOS. Backupen startar av sig själv när minnet sätts i, och varje kopierad fil kontrolleras med SHA-256 mot originalet.
+Verified, incremental backup of folders to USB drives on macOS. Plug in a drive and the backup starts by itself; every copied file is checked with SHA-256 against the original. Think of it as a small, free alternative to ChronoSync's "copy + verify" for external drives.
 
-## Vad den gör
+## Features
 
-1. **Startar automatiskt** när USB-minnet monteras (launchd, `StartOnMount`). Andra diskar ignoreras.
-2. **Kopierar bara nytt och ändrat** – jämför storlek och ändringstid mot kopian på minnet.
-3. **Verifierar varje kopierad fil** – SHA-256 på originalet och på kopian måste stämma, annars görs ett nytt försök. Filer skrivs först till ett temporärt namn och byter namn först när de är kompletta, så ett utryckt minne lämnar inga halva filer.
-4. **Sparar checksummor på minnet** (`USB_1TB/.raw-backup/manifest.sha256`).
-5. **Fullständig kontroll var 30:e dag** – läser tillbaka hela kopian och jämför mot checksummorna. Skadade filer kopieras om automatiskt från originalet.
-6. **Förloppsindikator** med procent, hastighet och beräknad tid kvar. I bakgrunden kommer notiser vid 25, 50 och 75 % (för jobb över 2 GB), och `--status` visar läget när som helst.
-7. **Notiser** när backupen är klar eller om något gått fel. Logg i `~/Library/Logs/raw-backup.log`.
+1. **Starts automatically** when a configured drive is mounted (launchd `StartOnMount`). Other drives are ignored.
+2. **Multiple jobs** – back up several folders, to one or several drives. Each job is *source folder → drive → folder on the drive*.
+3. **Copies only new and changed files** – compares size and modification time with the copy on the drive.
+4. **Verifies every copied file** – the SHA-256 of original and copy must match, otherwise the file is copied again. Files are written under a temporary name and renamed only when complete, so pulling the drive never leaves half-written files.
+5. **Keeps checksums on the drive** (`.raw-backup/jobs/<folder>/manifest.sha256`).
+6. **Full check every 30 days** – reads back the entire copy and compares it with the stored checksums. Damaged files are copied again from the original.
+7. **Progress bar** with percentage, speed and time remaining. In the background you get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
+8. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
 
-Skriptet **raderar aldrig** något på USB-minnet. Filer du tar bort i Raw ligger kvar på minnet.
+The script **never deletes** anything on the drives. Files you delete from a source folder stay on the drive.
 
 ## Installation
 
 ```bash
 git clone https://github.com/westruplabs/raw-backup.git
 cd raw-backup
-bash install.sh
+./install.sh
 ```
 
-Testa sedan utan att kopiera något (med minnet isatt):
+The installer asks for your first job (folder, drive, folder on the drive). Add more jobs later in the config file (see below).
+
+Then, with the drive plugged in, try it without copying anything:
 
 ```bash
-bash ~/Library/Scripts/raw-backup.sh --dry-run
+~/Library/Scripts/raw-backup.sh --dry-run
 ```
 
-### Behörighet i macOS (viktigt)
+### macOS permission (important)
 
-macOS kan blockera bakgrundsskript från att läsa USB-minnen. Om loggen visar `Operation not permitted`:
+macOS blocks background scripts from writing to external drives until you allow it. If you get the notification *"Cannot write to …"* or the log says `Operation not permitted`:
 
-**Systeminställningar → Integritet och säkerhet → Fullständig skivåtkomst** → `+` → tryck `⌘⇧G`, skriv `/bin/bash` → lägg till och slå på.
+**System Settings → Privacy & Security → Full Disk Access** → `+` → press `⌘⇧G`, type `/bin/bash` → add it and switch it on.
 
-Mata sedan ut minnet och sätt i det igen. (Det ger bash-skript full diskåtkomst generellt – det är standardlösningen för launchd-skript, men värt att känna till.)
+Then eject the drive and plug it in again. (This gives bash scripts full disk access in general – it is the standard solution for launchd scripts, but worth knowing.)
 
-## Användning
+## Configuration
 
-| Kommando | Vad det gör |
-|---|---|
-| `raw-backup.sh` | Kopiera nytt/ändrat och verifiera (körs automatiskt) |
-| `raw-backup.sh --dry-run` | Visa vad som skulle kopieras |
-| `raw-backup.sh --verify-all` | Kontrollera hela kopian nu och reparera fel |
-| `raw-backup.sh --status` | Visa hur långt en pågående backup har kommit |
+Everything lives in `~/.config/raw-backup.conf`. Updating the script never overwrites it.
 
-Skriptet ligger i `~/Library/Scripts/`. Kör det med `bash` framför, t.ex. `bash ~/Library/Scripts/raw-backup.sh --status`.
-
-Kör du skriptet i Terminal visas en förloppsrad som uppdateras löpande:
-
-```
-Kopierar [##########---------------]  41%  84.2 GB av 205.0 GB  96.3 MB/s  ca 21 min kvar  (1203/2950 filer)
+```bash
+JOBS='
+~/WORK/Raw          | USB_1TB   | Raw
+~/Documents/Work    | USB_1TB   | Work
+~/WORK/Raw          | BACKUP_2  | Raw
+'
 ```
 
-## Inställningar
+One job per line: **source folder | drive name | folder on the drive**.
 
-Ändra i `~/.config/raw-backup.conf` (skapas vid installationen):
+- **Drive name** is the name shown in Finder (the folder name under `/Volumes`).
+- **Folder on the drive** can be left out – it then gets the source folder's name. Use `.` for the top level of the drive.
+- Several folders can go to the same drive, and the same folder can go to several drives. When a drive is plugged in, all of its jobs run one after another.
+- Lines starting with `#` are ignored.
 
-| Inställning | Standard | |
+Check your jobs and which drives are connected:
+
+```bash
+~/Library/Scripts/raw-backup.sh --list
+```
+
+Other settings:
+
+| Setting | Default | |
 |---|---|---|
-| `SRC` | `~/WORK/Raw` | Källmapp |
-| `VOLUME_NAME` | `USB_1TB` | Minnets namn |
-| `DEST_SUBDIR` | `Raw` | Mapp på minnet |
-| `FULL_VERIFY_DAYS` | `30` | Fullständig kontroll var N:e dag, `0` = av |
-| `EJECT_WHEN_DONE` | `false` | Mata ut minnet efter lyckad backup |
-| `NOTIFY` | `true` | macOS-notiser |
+| `FULL_VERIFY_DAYS` | `30` | Full check every N days per job, `0` = off |
+| `EJECT_WHEN_DONE` | `false` | Eject the drive when all its jobs succeeded |
+| `NOTIFY` | `true` | macOS notifications |
 
-## Bra att veta
+## Usage
 
-- **Vänta på notisen** innan du drar ur minnet. Drar du ur mitt i avbryts körningen säkert och fortsätter nästa gång.
-- **Kontrollen direkt efter kopiering** kan i vissa fall läsa kopian från macOS minnescache i stället för från USB-minnet. Den månatliga fullständiga kontrollen körs direkt när minnet sätts i och läser då från själva minnet – det är den som fångar fel som uppstått på minnet över tid.
-- **Den fullständiga kontrollen tar tid** – ungefär lika länge som det tar att läsa hela minnet (för ett billigt USB-minne kan 500 GB ta en timme eller mer).
-- **Ett USB-minne är ingen fullständig backup.** Minnen går sönder och tappas bort. Ha minst en kopia till på annan plats (t.ex. NAS eller moln).
-- Fungerar med minnen formaterade som APFS, Mac OS Extended och exFAT.
+| Command | What it does |
+|---|---|
+| `raw-backup.sh` | Run every job whose drive is mounted (this runs automatically) |
+| `raw-backup.sh --dry-run` | Show what would be copied |
+| `raw-backup.sh --verify-all` | Full check of the copies now, repairing damaged files |
+| `raw-backup.sh --status` | Show progress of a running backup |
+| `raw-backup.sh --list` | Show configured jobs and whether their drives are mounted |
 
-## Avinstallera
+The script is installed in `~/Library/Scripts/`. Run in Terminal, it shows a live progress line:
 
-```bash
-bash uninstall.sh
+```
+[Raw → USB_1TB] Copying [##########---------------]  41%  84.2 GB of 205.0 GB  96.3 MB/s  about 21 min left  (1203/2950 files)
 ```
 
-## Licens
+## Good to know
+
+- **Wait for the "done" notification** before pulling the drive. If you pull it mid-run, the run stops safely and continues next time.
+- **The check right after copying** may in some cases read the copy from the macOS memory cache rather than from the drive. The periodic full check runs right after the drive is plugged in and reads from the drive itself – that is the one that catches damage that happens on the drive over time.
+- **The full check takes time** – roughly as long as reading the whole copy (500 GB on a cheap USB stick can take an hour or more).
+- **Drives are recognised by name.** Two drives with the same name are treated as the same drive.
+- **One USB drive is not a complete backup.** Drives fail and get lost. Keep at least one more copy elsewhere (NAS or cloud).
+- Works with drives formatted as APFS, Mac OS Extended and exFAT. NTFS drives are read-only on macOS.
+- Upgrading from the first version: an old single-folder config (`SRC`, `VOLUME_NAME`, `DEST_SUBDIR`) keeps working, and existing checksums on the drive are moved automatically.
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+## License
 
 MIT

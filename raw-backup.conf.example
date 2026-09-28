@@ -1,21 +1,32 @@
-# Inställningar för raw-backup. Ligger i ~/.config/raw-backup.conf
-# och skrivs inte över när skriptet uppdateras.
+# raw-backup configuration  (~/.config/raw-backup.conf)
+# This file is not overwritten when you update the script.
 
-# Mappen som ska säkerhetskopieras
-SRC="$HOME/WORK/Raw"
+# ---------------------------------------------------------------------------
+# Backup jobs - one per line:
+#
+#     source folder  |  drive name  |  folder on the drive
+#
+#   source folder        the folder to back up (~ means your home folder)
+#   drive name           the USB drive's name as shown in Finder
+#   folder on the drive  where the copy goes; leave it out to use the source
+#                        folder's name, or use . for the top level of the drive
+#
+# Several folders can go to the same drive, and the same folder can go to
+# several drives. Every job whose drive is plugged in runs automatically.
+# Lines starting with # are ignored.
+# ---------------------------------------------------------------------------
+JOBS='
+~/Pictures/Raw      | USB_1TB   | Raw
+# ~/Documents/Work  | USB_1TB   | Work
+# ~/Pictures/Raw    | BACKUP_2  | Raw
+'
 
-# USB-minnets namn (som det heter i Finder)
-VOLUME_NAME="USB_1TB"
-
-# Mapp på USB-minnet där kopian hamnar
-DEST_SUBDIR="Raw"
-
-# Läs tillbaka HELA kopian och jämför checksummor var N:e dag (0 = aldrig automatiskt).
-# Tar tid: ungefär lika lång tid som att läsa hela minnet.
+# Read back the entire copy and compare checksums every N days, per job.
+# Takes roughly as long as reading the whole copy. 0 = never automatically.
 FULL_VERIFY_DAYS=30
 
-# Mata ut USB-minnet automatiskt när backupen gått bra
+# Eject the drive automatically when all its jobs succeeded
 EJECT_WHEN_DONE=false
 
-# Visa notiser i macOS
+# Show macOS notifications
 NOTIFY=true
