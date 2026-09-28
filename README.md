@@ -9,7 +9,8 @@ Automatisk backup av `~/WORK/Raw` till ett USB-minne (`USB_1TB`) på macOS. Back
 3. **Verifierar varje kopierad fil** – SHA-256 på originalet och på kopian måste stämma, annars görs ett nytt försök. Filer skrivs först till ett temporärt namn och byter namn först när de är kompletta, så ett utryckt minne lämnar inga halva filer.
 4. **Sparar checksummor på minnet** (`USB_1TB/.raw-backup/manifest.sha256`).
 5. **Fullständig kontroll var 30:e dag** – läser tillbaka hela kopian och jämför mot checksummorna. Skadade filer kopieras om automatiskt från originalet.
-6. **Notiser** när backupen är klar eller om något gått fel. Logg i `~/Library/Logs/raw-backup.log`.
+6. **Förloppsindikator** med procent, hastighet och beräknad tid kvar. I bakgrunden kommer notiser vid 25, 50 och 75 % (för jobb över 2 GB), och `--status` visar läget när som helst.
+7. **Notiser** när backupen är klar eller om något gått fel. Logg i `~/Library/Logs/raw-backup.log`.
 
 Skriptet **raderar aldrig** något på USB-minnet. Filer du tar bort i Raw ligger kvar på minnet.
 
@@ -18,13 +19,13 @@ Skriptet **raderar aldrig** något på USB-minnet. Filer du tar bort i Raw ligge
 ```bash
 git clone https://github.com/westruplabs/raw-backup.git
 cd raw-backup
-./install.sh
+bash install.sh
 ```
 
 Testa sedan utan att kopiera något (med minnet isatt):
 
 ```bash
-~/Library/Scripts/raw-backup.sh --dry-run
+bash ~/Library/Scripts/raw-backup.sh --dry-run
 ```
 
 ### Behörighet i macOS (viktigt)
@@ -33,7 +34,7 @@ macOS kan blockera bakgrundsskript från att läsa USB-minnen. Om loggen visar `
 
 **Systeminställningar → Integritet och säkerhet → Fullständig skivåtkomst** → `+` → tryck `⌘⇧G`, skriv `/bin/bash` → lägg till och slå på.
 
-Kör sedan `./install.sh` igen. (Det ger bash-skript full diskåtkomst generellt – det är standardlösningen för launchd-skript, men värt att känna till.)
+Mata sedan ut minnet och sätt i det igen. (Det ger bash-skript full diskåtkomst generellt – det är standardlösningen för launchd-skript, men värt att känna till.)
 
 ## Användning
 
@@ -42,8 +43,15 @@ Kör sedan `./install.sh` igen. (Det ger bash-skript full diskåtkomst generellt
 | `raw-backup.sh` | Kopiera nytt/ändrat och verifiera (körs automatiskt) |
 | `raw-backup.sh --dry-run` | Visa vad som skulle kopieras |
 | `raw-backup.sh --verify-all` | Kontrollera hela kopian nu och reparera fel |
+| `raw-backup.sh --status` | Visa hur långt en pågående backup har kommit |
 
-Skriptet ligger i `~/Library/Scripts/`.
+Skriptet ligger i `~/Library/Scripts/`. Kör det med `bash` framför, t.ex. `bash ~/Library/Scripts/raw-backup.sh --status`.
+
+Kör du skriptet i Terminal visas en förloppsrad som uppdateras löpande:
+
+```
+Kopierar [##########---------------]  41%  84.2 GB av 205.0 GB  96.3 MB/s  ca 21 min kvar  (1203/2950 filer)
+```
 
 ## Inställningar
 
@@ -69,7 +77,7 @@ Skriptet ligger i `~/Library/Scripts/`.
 ## Avinstallera
 
 ```bash
-./uninstall.sh
+bash uninstall.sh
 ```
 
 ## Licens

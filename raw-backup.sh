@@ -12,6 +12,7 @@
 #   raw-backup.sh --dry-run      visa vad som skulle kopieras, ändra ingenting
 #   raw-backup.sh --verify-all   läs tillbaka HELA kopian på USB-minnet och
 #                                jämför mot sparade checksummor (reparerar fel)
+#   raw-backup.sh --status       visa hur långt en pågående backup har kommit
 #   raw-backup.sh --help
 #
 # Skriptet raderar aldrig något på USB-minnet. Filer du tar bort i Raw ligger
@@ -47,7 +48,9 @@ LOCK_DIR="/tmp/raw-backup-$(id -u).lock"
 EXCLUDE_RE='/(\.DS_Store|\._[^/]*|\.Spotlight-V100|\.Trashes|\.fseventsd|\.TemporaryItems|\.DocumentRevisions-V100)(/|$)'
 PARTIAL_SUFFIX=".rbpartial"
 
-if [ "$(uname)" = "Darwin" ]; then CP_OPTS="-X"; else CP_OPTS=""; fi
+STATUS_FILE="$HOME/Library/Logs/raw-backup.status"
+OS="$(uname)"
+if [ "$OS" = "Darwin" ]; then CP_OPTS="-X"; else CP_OPTS=""; fi
 
 WORK=""
 FAILED=0
@@ -55,12 +58,98 @@ COPIED=0
 COPIED_BYTES=0
 NEW_HASHES=""
 
+# Förloppsindikator
+PROG_LABEL=""; PROG_TOTAL_FILES=0; PROG_TOTAL_BYTES=0; PROG_DONE_FILES=0; PROG_DONE_BYTES=0
+PROG_START=0; PROG_LAST_WRITE=-10; PROG_NEXT_MILESTONE=25
+MILESTONE_MIN_BYTES=$((2 * 1024 * 1024 * 1024))   # notiser vid 25/50/75 % bara för jobb över 2 GB
+
+# ---------------------------------------------------------------- förlopp
+
+file_size() {
+    local s
+    if [ "$OS" = "Darwin" ]; then s=$(stat -f %z "$1" 2>/dev/null); else s=$(stat -c %s "$1" 2>/dev/null); fi
+    echo "${s:-0}"
+}
+
+progress_start() {  # $1 etikett, $2 antal filer, $3 antal byte
+    PROG_LABEL="$1"; PROG_TOTAL_FILES="$2"; PROG_TOTAL_BYTES="$3"
+    PROG_DONE_FILES=0; PROG_DONE_BYTES=0; PROG_START=$SECONDS
+    PROG_LAST_WRITE=-10; PROG_NEXT_MILESTONE=25
+    mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null
+    progress_show
+}
+
+progress_add() {  # $1 byte för filen som just blev klar
+    PROG_DONE_FILES=$((PROG_DONE_FILES + 1))
+    PROG_DONE_BYTES=$((PROG_DONE_BYTES + ${1:-0}))
+    progress_show
+}
+
+progress_show() {
+    local elapsed=$((SECONDS - PROG_START)) out pct long short
+    out=$(awk -v d="$PROG_DONE_BYTES" -v t="$PROG_TOTAL_BYTES" -v e="$elapsed" \
+              -v fd="$PROG_DONE_FILES" -v ft="$PROG_TOTAL_FILES" '
+        function h(b,   u, i) { split("B KB MB GB TB", u, " "); i = 1
+            while (b >= 1024 && i < 5) { b /= 1024; i++ }
+            return (i == 1) ? sprintf("%d %s", b, u[i]) : sprintf("%.1f %s", b, u[i]) }
+        BEGIN {
+            pct = (t > 0) ? d * 100 / t : ((ft > 0) ? fd * 100 / ft : 100)
+            if (pct > 100) pct = 100
+            w = 25; n = int(pct * w / 100 + 0.5); bar = ""
+            for (i = 0; i < w; i++) bar = bar ((i < n) ? "#" : "-")
+            rate = (e > 0) ? d / e : 0
+            if (fd >= ft) eta = "klart"
+            else if (rate > 0 && d > 0 && e >= 3) {
+                r = (t - d) / rate
+                if (r < 60) eta = "under 1 min kvar"
+                else if (r < 3600) eta = sprintf("ca %d min kvar", int(r / 60 + 0.5))
+                else eta = sprintf("ca %d h %d min kvar", int(r / 3600), int((r - int(r / 3600) * 3600) / 60))
+            } else eta = "beräknar tid..."
+            speed = (rate > 0) ? h(rate) "/s" : "-"
+            printf "%d\t[%s] %3d%%  %s av %s  %s  %s  (%d/%d filer)\t%d %% klart, %s av %s. %s.",
+                int(pct), bar, pct, h(d), h(t), speed, eta, fd, ft, int(pct), h(d), h(t), eta
+        }')
+    pct="${out%%$'\t'*}"; out="${out#*$'\t'}"
+    long="${out%%$'\t'*}"; short="${out#*$'\t'}"
+
+    if [ -t 1 ]; then
+        printf '\r%s %s\033[K' "$PROG_LABEL" "$long"
+    fi
+    # Statusfil för 'raw-backup.sh --status' (högst varannan sekund)
+    if [ $((SECONDS - PROG_LAST_WRITE)) -ge 2 ] || [ "$PROG_DONE_FILES" -ge "$PROG_TOTAL_FILES" ]; then
+        { printf '%s %s\n' "$PROG_LABEL" "$long" > "$STATUS_FILE"; } 2>/dev/null
+        PROG_LAST_WRITE=$SECONDS
+    fi
+    # Notiser vid 25/50/75 % när skriptet körs i bakgrunden
+    if [ ! -t 1 ] && [ "$PROG_TOTAL_BYTES" -ge "$MILESTONE_MIN_BYTES" ]; then
+        while [ "$PROG_NEXT_MILESTONE" -lt 100 ] && [ "$pct" -ge "$PROG_NEXT_MILESTONE" ]; do
+            notify "Raw-backup: $PROG_LABEL" "$short"
+            PROG_NEXT_MILESTONE=$((PROG_NEXT_MILESTONE + 25))
+        done
+    fi
+}
+
+progress_end() { [ -t 1 ] && printf '\n'; return 0; }
+
+show_status() {
+    local pid
+    pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -f "$STATUS_FILE" ]; then
+        cat "$STATUS_FILE"
+    elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "Backup pågår (förbereder)…"
+    else
+        echo "Ingen backup pågår just nu."
+        [ -f "$LOG_FILE" ] && echo "Senast: $(grep -v '^ ' "$LOG_FILE" | tail -1)"
+    fi
+}
+
 # ---------------------------------------------------------------- hjälpfunktioner
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
     printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
-    if [ -t 1 ]; then printf '%s\n' "$*"; fi
+    if [ -t 1 ]; then printf '\r\033[K%s\n' "$*"; fi
 }
 
 notify() {  # $1 rubrik, $2 text
@@ -94,14 +183,14 @@ acquire_lock() {
 
 cleanup() {
     [ -n "$WORK" ] && rm -rf "$WORK"
-    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR"; fi
+    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR" "$STATUS_FILE"; fi
 }
 
 hash_of() { shasum -a 256 < "$1" 2>/dev/null | awk '{print $1}'; }
 
 # Skriver "storlek<TAB>mtime<TAB>./relativ/sökväg" för alla filer under $1
 list_files() {
-    if [ "$(uname)" = "Darwin" ]; then
+    if [ "$OS" = "Darwin" ]; then
         (cd "$1" && find . -type f -exec stat -f '%z%t%m%t%N' {} +)
     else
         (cd "$1" && find . -type f -printf '%s\t%T@\t%p\n')
@@ -154,12 +243,16 @@ merge_manifest() {
 
 run_copy_list() {  # $1 = fil med relativa sökvägar, en per rad
     local rel rc
+    local size
     while IFS= read -r -u 3 rel; do
         [ -n "$rel" ] || continue
+        size=$(file_size "$SRC/$rel")
         copy_verified "$rel"; rc=$?
-        if [ $rc -eq 2 ]; then return 2; fi
+        if [ $rc -eq 2 ]; then progress_end; return 2; fi
         [ $rc -eq 0 ] || FAILED=$((FAILED + 1))
+        progress_add "$size"
     done 3< "$1"
+    progress_end
     return 0
 }
 
@@ -206,6 +299,7 @@ do_sync() {
 
     notify "Raw-backup" "Kopierar $n filer ($(human "$need_bytes"))…"
     cut -f2 "$WORK/tocopy.lst" > "$WORK/tocopy.paths"
+    progress_start "Kopierar" "$n" "$need_bytes"
     run_copy_list "$WORK/tocopy.paths"; local rc=$?
     merge_manifest
     [ $rc -eq 2 ] && return 2
@@ -216,7 +310,8 @@ do_verify_all() {
     log "Fullständig kontroll startar (läser hela kopian på USB-minnet)…"
     notify "Raw-backup" "Fullständig kontroll av USB-kopian startar…"
     touch "$MANIFEST"
-    list_files "$DEST" | awk -F'\t' '{ p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sub(/^\.\//, "", p); print p }' \
+    list_files "$DEST" > "$WORK/dst.lst"
+    awk -F'\t' '{ p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sub(/^\.\//, "", p); print p }' "$WORK/dst.lst" \
         | sort > "$WORK/dst.paths"
 
     # 1. Ta bort manifest-rader för filer som inte längre finns på minnet
@@ -226,8 +321,27 @@ do_verify_all() {
     # 2. Läs tillbaka varje fil och jämför med sparad checksumma
     local checked bad=0 rel
     checked=$(wc -l < "$WORK/manifest.present" | tr -d ' ')
-    ( cd "$DEST" && shasum -a 256 -c "$WORK/manifest.present" 2>/dev/null ) \
-        | grep -v ': OK$' | sed 's/: FAILED.*$//' > "$WORK/bad.paths"
+    # Filstorlekar i samma ordning som manifestet, för förloppsindikatorn
+    awk -F'\t' 'FILENAME == ARGV[1] { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sub(/^\.\//, "", p); sz[p] = $1; next }
+                 { k = substr($0, 67); print ((k in sz) ? sz[k] : 0) }' "$WORK/dst.lst" "$WORK/manifest.present" > "$WORK/sizes"
+    local total_bytes line sz
+    total_bytes=$(awk '{ s += $1 } END { printf "%.0f", s }' "$WORK/sizes")
+    : > "$WORK/bad.paths"
+    # shasum är ett Perl-skript; utan autoflush kommer resultaten i klumpar och förloppet hackar
+    printf 'package RawBackupAutoflush; $| = 1; 1;\n' > "$WORK/RawBackupAutoflush.pm"
+    progress_start "Kontrollerar" "$checked" "$total_bytes"
+    exec 4< "$WORK/sizes"
+    while IFS= read -r line; do
+        IFS= read -r -u 4 sz || sz=0
+        case "$line" in
+            *": OK") ;;
+            *) printf '%s\n' "${line%%: FAILED*}" >> "$WORK/bad.paths" ;;
+        esac
+        progress_add "$sz"
+    done < <(cd "$DEST" && PERL5LIB="$WORK" PERL5OPT="-MRawBackupAutoflush" \
+                 shasum -a 256 -c "$WORK/manifest.present" 2>/dev/null)
+    exec 4<&-
+    progress_end
     is_mounted || { log "FEL: USB-minnet försvann under kontrollen"; return 2; }
     bad=$(grep -c . "$WORK/bad.paths" || true)
 
@@ -255,7 +369,9 @@ do_verify_all() {
     # 4. Reparera avvikande filer från källan
     if [ "$bad" -gt 0 ]; then
         log "Avvikande filer:"; sed 's/^/    /' "$WORK/bad.paths" >> "$LOG_FILE"
-        local before=$FAILED
+        local before=$FAILED rb
+        rb=$(while IFS= read -r rel; do file_size "$SRC/$rel"; done < "$WORK/bad.paths" | awk '{ s += $1 } END { printf "%.0f", s }')
+        progress_start "Reparerar" "$bad" "$rb"
         run_copy_list "$WORK/bad.paths" || return 2
         merge_manifest
         local unrepaired=$((FAILED - before))
@@ -290,6 +406,7 @@ main() {
         "")            mode="sync" ;;
         --dry-run|-n)  mode="dry" ;;
         --verify-all)  mode="verify" ;;
+        --status)      show_status; exit 0 ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Okänt argument: $1" >&2; usage; exit 64 ;;
     esac
