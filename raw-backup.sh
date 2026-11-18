@@ -114,6 +114,12 @@ acquire_lock() {
     mkdir "$LOCK_DIR" 2>/dev/null && echo $$ > "$LOCK_DIR/pid"
 }
 
+# On exit (also Ctrl+C): store checksums of files verified so far
+save_progress() {
+    [ -n "$NEW_HASHES" ] && [ -s "$NEW_HASHES" ] && [ -n "$JW" ] && is_mounted && merge_manifest 2>/dev/null
+    return 0
+}
+
 cleanup() {
     [ -n "$WORK" ] && rm -rf "$WORK"
     if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR" "$STATUS_FILE"; fi
@@ -435,7 +441,7 @@ merge_manifest() {
 }
 
 run_copy_list() {  # $1 = file with relative paths, one per line
-    local rel rc size
+    local rel rc size k=0
     while IFS= read -r -u 3 rel; do
         [ -n "$rel" ] || continue
         size=$(file_size "$SRC/$rel")
@@ -443,6 +449,8 @@ run_copy_list() {  # $1 = file with relative paths, one per line
         if [ $rc -eq 2 ]; then progress_end; return 2; fi
         [ $rc -eq 0 ] || FAILED=$((FAILED + 1))
         progress_add "$size"
+        # Save checksums every 100 files, so a long run that is stopped keeps them
+        k=$((k + 1)); [ $((k % 100)) -eq 0 ] && merge_manifest
     done 3< "$1"
     progress_end
     return 0
@@ -779,7 +787,8 @@ main() {
         acquire_lock || { log "Another run is already in progress - exiting."; exit 0; }
     fi
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/raw-backup.XXXXXX")
-    trap 'net_unmount_ours; cleanup' EXIT
+    trap 'save_progress; net_unmount_ours; cleanup' EXIT
+    trap 'log "Stopped by user."; exit 130' INT TERM
 
     if [ "$target" = "nas" ]; then
         run_nas_jobs "$mode" "no-ask"; exit $?
