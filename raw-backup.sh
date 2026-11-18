@@ -1,12 +1,14 @@
 #!/bin/bash
 #
 # raw-backup.sh
-# Verified, incremental backup of folders to USB drives on macOS.
+# Verified, incremental backup of folders to USB drives - and optionally a NAS -
+# on macOS.
 #
-# You define one or more jobs (source folder -> USB drive -> folder on the
-# drive) in ~/.config/raw-backup.conf. When a drive is plugged in, launchd
-# starts this script, which runs every job for the drives that are mounted:
-# new and changed files are copied and every copy is checked with SHA-256.
+# You define one or more jobs (source folder -> USB drive or NAS share -> folder)
+# in ~/.config/raw-backup.conf. When a drive is plugged in, launchd starts this
+# script, which runs every job for the drives that are mounted: new and changed
+# files are copied and every copy is checked with SHA-256. NAS jobs run after
+# that if NAS_UPLOAD says so, or whenever you run the script with --nas.
 #
 # https://github.com/westruplabs/raw-backup
 #
@@ -22,6 +24,10 @@ NOTIFY=true                 # macOS notifications
 LOG_FILE="$HOME/Library/Logs/raw-backup.log"
 MTIME_TOLERANCE=2           # seconds (FAT/exFAT store timestamps coarsely)
 VOLUMES_ROOT="/Volumes"
+NAS_UPLOAD=ask              # NAS jobs after a USB backup: ask | auto | off  (off = only with --nas)
+NAS_ASK_TIMEOUT=120         # seconds to wait for an answer; no answer = skip the NAS this time
+NAS_FULL_VERIFY_DAYS=0      # full read-back of NAS copies every N days (0 = only with --nas --verify-all)
+NAS_MOUNT_TIMEOUT=60        # seconds to wait for the NAS share to mount
 # Legacy single-job settings (v1). Still honoured if JOBS is empty.
 SRC=""; VOLUME_NAME=""; DEST_SUBDIR=""
 # -----------------------------------------------------------------------
@@ -33,7 +39,7 @@ CONFIG_FILE="${RAW_BACKUP_CONFIG:-$HOME/.config/raw-backup.conf}"
 APP="Raw-backup"
 LOCK_DIR="/tmp/raw-backup-$(id -u).lock"
 STATUS_FILE="$HOME/Library/Logs/raw-backup.status"
-EXCLUDE_RE='/(\.DS_Store|\._[^/]*|\.Spotlight-V100|\.Trashes|\.fseventsd|\.TemporaryItems|\.DocumentRevisions-V100|\.raw-backup)(/|$)'
+EXCLUDE_RE='/(\.DS_Store|\._[^/]*|\.Spotlight-V100|\.Trashes|\.fseventsd|\.TemporaryItems|\.DocumentRevisions-V100|\.raw-backup|@eaDir|#recycle)(/|$)'
 PARTIAL_SUFFIX=".rbpartial"
 OS="$(uname)"
 if [ "$OS" = "Darwin" ]; then CP_OPTS="-X"; else CP_OPTS=""; fi
@@ -41,6 +47,9 @@ if [ "$OS" = "Darwin" ]; then CP_OPTS="-X"; else CP_OPTS=""; fi
 # Parsed jobs (indexed arrays work in bash 3.2)
 JOB_COUNT=0
 JOB_SRC=(); JOB_VOL=(); JOB_DIR=()
+JOB_NET=(); JOB_MP=()       # NAS jobs: 1 / mount point once mounted
+NAS_MOUNTED_BY_US=$'\n'     # shares this run mounted itself (unmounted again at the end)
+JOB_IS_NET=0
 
 # Current job (set by set_job)
 JOB_IDX=0; JOB_LABEL=""
@@ -121,6 +130,93 @@ list_files() {
     fi | { grep -Ev "$EXCLUDE_RE" || true; }
 }
 
+# Runs a command, killing it after $1 seconds (macOS has no 'timeout'). 124 = timed out.
+with_timeout() {
+    local secs="$1" pid i=0; shift
+    "$@" & pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ $i -ge $((secs * 10)) ]; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+        sleep 0.1; i=$((i + 1))
+    done
+    wait "$pid"
+}
+
+# ---------------------------------------------------------------- NAS (SMB/AFP shares)
+
+is_url() { case "$1" in smb://*|afp://*) return 0 ;; esac; return 1; }
+
+url_host() { local r="${1#*://}"; r="${r%%/*}"; r="${r##*@}"; printf '%s' "${r%%:*}"; }
+url_share() { local r="${1#*://}"; case "$r" in */*) r="${r#*/}" ;; *) r="" ;; esac; printf '%s' "${r%/}"; }
+url_port() {
+    local r="${1#*://}"; r="${r%%/*}"; r="${r##*@}"
+    case "$r" in *:*) printf '%s' "${r##*:}"; return ;; esac
+    case "$1" in afp://*) printf '548' ;; *) printf '445' ;; esac
+}
+
+# Can we open a TCP connection to the NAS within 3 seconds?
+reachable() {  # $1 = url
+    local h p
+    h=$(url_host "$1"); p=$(url_port "$1")
+    if command -v perl >/dev/null 2>&1; then
+        perl -MIO::Socket::INET -e 'exit(IO::Socket::INET->new(PeerAddr => $ARGV[0], PeerPort => $ARGV[1],
+            Proto => "tcp", Timeout => 3) ? 0 : 1)' "$h" "$p" 2>/dev/null
+    else
+        nc -z -G 3 "$h" "$p" >/dev/null 2>&1
+    fi
+}
+
+# Prints the mount point if the share is already mounted (by Finder or by us)
+net_find_mount() {  # $1 = url
+    mount | awk -v h="$(url_host "$1")" -v s="$(url_share "$1")" '
+        function norm(x) { x = tolower(x); gsub(/%20/, " ", x)
+            sub(/\._(smb|afpovertcp)\._tcp\.local\.?$/, "", x); sub(/\.local\.?$/, "", x); return x }
+        / \((smbfs|afpfs)[,)]/ {
+            src = $1; sub(/^\/\//, "", src); hs = src; sub(/\/.*/, "", hs); sub(/.*@/, "", hs); sub(/:.*/, "", hs)
+            sh = src; sub(/^[^\/]*\//, "", sh)
+            mp = $0; sub(/^[^ ]* on /, "", mp); sub(/ \((smbfs|afpfs)[,)].*$/, "", mp)
+            if (norm(hs) == norm(h) && norm(sh) == norm(s)) { print mp; exit }
+        }'
+}
+
+# Mounts the share (macOS uses the password saved in the keychain). Prints the mount point.
+net_mount() {  # $1 = url
+    local mp
+    mp=$(net_find_mount "$1")
+    if [ -n "$mp" ]; then printf '%s' "$mp"; return 0; fi
+    command -v osascript >/dev/null 2>&1 || return 1
+    with_timeout "$NAS_MOUNT_TIMEOUT" osascript -e "mount volume \"$1\"" >/dev/null 2>>"$LOG_FILE" || return 1
+    mp=$(net_find_mount "$1")
+    [ -n "$mp" ] || return 1
+    printf '%s' "$mp"
+}
+
+net_unmount_ours() {
+    local mp
+    while IFS= read -r mp; do
+        [ -n "$mp" ] || continue
+        is_mounted "$mp" || continue
+        if { diskutil unmount "$mp" || umount "$mp"; } >/dev/null 2>&1; then log "Unmounted $mp."; fi
+    done <<< "$NAS_MOUNTED_BY_US"
+    NAS_MOUNTED_BY_US=$'\n'
+}
+
+# Asks whether to upload now. Terminal: y/N prompt. Background: a dialog.
+# No answer within NAS_ASK_TIMEOUT counts as "not now".
+ask_upload() {  # $1 = question
+    local ans
+    if [ -t 0 ] && [ -t 1 ]; then
+        printf '\r\033[K%s [y/N] ' "$1"
+        read -r -t "$NAS_ASK_TIMEOUT" ans || { echo; return 1; }
+        case "$ans" in [yYjJ]*) return 0 ;; esac
+        return 1
+    fi
+    command -v osascript >/dev/null 2>&1 || return 1
+    local q="${1//\"/\'}"
+    ans=$(osascript -e "display dialog \"$q\" with title \"$APP\" buttons {\"Not now\", \"Upload\"} default button \"Upload\" cancel button \"Not now\" with icon note giving up after $NAS_ASK_TIMEOUT" 2>/dev/null) || return 1
+    case "$ans" in *"gave up:true"*) return 1 ;; *"button returned:Upload"*) return 0 ;; esac
+    return 1
+}
+
 # ---------------------------------------------------------------- jobs
 
 config_error() {
@@ -148,14 +244,22 @@ load_jobs() {
         case "$s" in "~") s="$HOME" ;; "~/"*) s="$HOME/${s#\~/}" ;; esac
         s="${s%/}"
         [ -n "$s" ] && [ -n "$v" ] || config_error "job line is missing source or volume"
-        case "$v" in */*) config_error "volume name must be the drive name, not a path: $v" ;; esac
+        if is_url "$v"; then
+            v="${v%/}"
+            case "$(url_share "$v")" in ""|*/*) config_error "NAS address must be smb://server/share - put subfolders in the third column: $v" ;; esac
+            [ -n "$(url_host "$v")" ] || config_error "NAS address has no server name: $v"
+            JOB_NET[n]=1
+        else
+            case "$v" in */*) config_error "volume name must be the drive name, not a path: $v" ;; esac
+            JOB_NET[n]=0
+        fi
         [ -n "$d" ] || d=$(basename "$s")
         d="${d#/}"; d="${d%/}"; [ -n "$d" ] || d="."
         case "/$d/" in */../*) config_error "folder on volume may not contain '..': $d" ;; esac
         key="$v|$d"
         case "$seen" in *$'\n'"$key"$'\n'*) config_error "two jobs write to the same folder: $v/$d" ;; esac
         seen="$seen$key"$'\n'
-        JOB_SRC[n]="$s"; JOB_VOL[n]="$v"; JOB_DIR[n]="$d"
+        JOB_SRC[n]="$s"; JOB_VOL[n]="$v"; JOB_DIR[n]="$d"; JOB_MP[n]=""
         n=$((n + 1))
     done <<< "$jobs"
     JOB_COUNT=$n
@@ -165,7 +269,13 @@ load_jobs() {
 set_job() {  # $1 = job index
     JOB_IDX="$1"
     SRC="${JOB_SRC[$1]}"; VOLUME_NAME="${JOB_VOL[$1]}"; DEST_SUBDIR="${JOB_DIR[$1]}"
-    VOLUME="$VOLUMES_ROOT/$VOLUME_NAME"
+    JOB_IS_NET="${JOB_NET[$1]}"
+    if [ "$JOB_IS_NET" = 1 ]; then
+        VOLUME="${JOB_MP[$1]:-/nonexistent-nas-mount}"
+        VOLUME_NAME="$(url_host "${JOB_VOL[$1]}")/$(url_share "${JOB_VOL[$1]}")"
+    else
+        VOLUME="$VOLUMES_ROOT/$VOLUME_NAME"
+    fi
     META_ROOT="$VOLUME/.raw-backup"
     local slug
     if [ "$DEST_SUBDIR" = "." ]; then DEST="$VOLUME"; slug="_root"
@@ -182,10 +292,15 @@ list_jobs() {
     printf '%-3s %-40s %-16s %-16s %s\n' "#" "SOURCE" "VOLUME" "FOLDER" "MOUNTED"
     for ((i = 0; i < JOB_COUNT; i++)); do
         set_job "$i"
-        if is_mounted; then m="yes"; else m="no"; fi
+        if [ "$JOB_IS_NET" = 1 ]; then
+            if [ -n "$(net_find_mount "${JOB_VOL[$i]}")" ]; then m="NAS, mounted"
+            elif reachable "${JOB_VOL[$i]}"; then m="NAS, reachable"
+            else m="NAS, not reachable"; fi
+        elif is_mounted; then m="yes"; else m="no"; fi
         printf '%-3s %-40s %-16s %-16s %s\n' "$((i + 1))" "$SRC" "$VOLUME_NAME" "$DEST_SUBDIR" "$m"
     done
     echo
+    echo "NAS upload after USB backups: $NAS_UPLOAD"
     echo "Config: $CONFIG_FILE"
 }
 
@@ -284,7 +399,7 @@ copy_verified() {  # $1 = relative path
     mkdir -p "$dir" || { log "ERROR: cannot create folder $dir"; return 1; }
 
     for attempt in 1 2; do
-        is_mounted || { log "ERROR: $VOLUME_NAME was disconnected during copy"; return 2; }
+        is_mounted || { log "ERROR: lost $VOLUME_NAME during copy"; return 2; }
         rm -f "$tmp"
         # shellcheck disable=SC2086
         if cp $CP_OPTS "$s" "$tmp" 2>>"$LOG_FILE" && touch -r "$s" "$tmp" && mv -f "$tmp" "$d"; then
@@ -335,8 +450,9 @@ run_copy_list() {  # $1 = file with relative paths, one per line
 
 # ---------------------------------------------------------------- modes
 
-do_sync() {
-    local dry="$1"
+# Works out what needs copying -> $JW/tocopy.lst, PLAN_FILES, PLAN_BYTES.
+PLAN_FILES=0; PLAN_BYTES=0
+plan_job() {
     list_files "$SRC" > "$JW/src.lst" 2> "$JW/src.err"
     if [ -s "$JW/src.err" ]; then
         log "WARNING while reading source:"; cat "$JW/src.err" >> "$LOG_FILE"
@@ -354,12 +470,25 @@ do_sync() {
         FILENAME == ARGV[1] { dsz[p] = $1; dmt[p] = m; next }
         { if (!(p in dsz) || dsz[p] != $1 || dmt[p] - m > tol || m - dmt[p] > tol)
               print $1 "\t" p }
-    ' "$JW/dst.lst" "$JW/src.lst" | sort -t "$(printf '\t')" -k2 > "$JW/tocopy.lst"
+    ' "$JW/dst.lst" "$JW/src.lst" | sort -t "$(printf '\t')" -k2 > "$JW/tocopy.tmp"
+    mv -f "$JW/tocopy.tmp" "$JW/tocopy.lst"
 
-    local n need_bytes free_kb
-    n=$(wc -l < "$JW/tocopy.lst" | tr -d ' ')
-    need_bytes=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/tocopy.lst")
-    log "[$JOB_LABEL] Source: $(wc -l < "$JW/src.lst" | tr -d ' ') files. To copy: $n files ($(human "$need_bytes"))."
+    PLAN_FILES=$(wc -l < "$JW/tocopy.lst" | tr -d ' ')
+    PLAN_BYTES=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/tocopy.lst")
+    log "[$JOB_LABEL] Source: $(wc -l < "$JW/src.lst" | tr -d ' ') files. To copy: $PLAN_FILES files ($(human "$PLAN_BYTES"))."
+    return 0
+}
+
+do_sync() {
+    local dry="$1"
+    # The NAS step may already have planned this job (to ask before uploading)
+    if [ -f "$JW/tocopy.lst" ]; then
+        PLAN_FILES=$(wc -l < "$JW/tocopy.lst" | tr -d ' ')
+        PLAN_BYTES=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/tocopy.lst")
+    else
+        plan_job || return 1
+    fi
+    local n="$PLAN_FILES" need_bytes="$PLAN_BYTES" free_kb
 
     if [ "$dry" = "true" ]; then
         [ -t 1 ] || echo "[$JOB_LABEL] $n files to copy ($(human "$need_bytes")):"
@@ -465,13 +594,14 @@ do_verify_all() {
 }
 
 verify_due() {
-    [ "$FULL_VERIFY_DAYS" -gt 0 ] 2>/dev/null || return 1
-    local last now
+    local days="$FULL_VERIFY_DAYS" last now
+    [ "$JOB_IS_NET" = 1 ] && days="$NAS_FULL_VERIFY_DAYS"
+    [ "$days" -gt 0 ] 2>/dev/null || return 1
     now=$(date +%s)
     # First run: everything just copied is already verified - start the clock now
     if [ ! -f "$LAST_VERIFY_FILE" ]; then echo "$now" > "$LAST_VERIFY_FILE"; return 1; fi
     last=$(cat "$LAST_VERIFY_FILE" 2>/dev/null || echo 0)
-    [ $((now - last)) -ge $((FULL_VERIFY_DAYS * 86400)) ]
+    [ $((now - last)) -ge $((days * 86400)) ]
 }
 
 # Runs one job in the given mode. Returns 0 ok, 1 error, 2 drive disconnected.
@@ -479,6 +609,7 @@ run_job() {
     local mode="$1" start=$SECONDS rc=0 did_verify=false
     FAILED=0; COPIED=0; COPIED_BYTES=0
     JW="$WORK/job$JOB_IDX"; mkdir -p "$JW"
+    [ "$mode" = "sync" ] || rm -f "$JW/tocopy.lst"
     NEW_HASHES="$JW/new.sha256"; : > "$NEW_HASHES"
 
     if [ ! -d "$SRC" ]; then
@@ -509,7 +640,11 @@ run_job() {
     [ "$did_verify" = true ] && summary="$summary Full check done."
 
     if [ $rc -eq 2 ]; then
-        notify "$APP: INTERRUPTED" "$VOLUME_NAME was disconnected. The backup continues next time it is plugged in."
+        if [ "$JOB_IS_NET" = 1 ]; then
+            notify "$APP: INTERRUPTED" "Lost the connection to $VOLUME_NAME. The upload continues next time."
+        else
+            notify "$APP: INTERRUPTED" "$VOLUME_NAME was disconnected. The backup continues next time it is plugged in."
+        fi
         summary="INTERRUPTED. $summary"
     elif [ $rc -ne 0 ] || [ $FAILED -gt 0 ]; then
         notify "$APP: ERROR" "[$JOB_LABEL] $FAILED files failed. See ~/Library/Logs/raw-backup.log"
@@ -525,53 +660,130 @@ run_job() {
 
 usage() {
     cat <<EOF
-Usage: raw-backup.sh [option]
+Usage: raw-backup.sh [--nas] [option]
 
-  (no option)    copy new/changed files for every job whose drive is mounted,
-                 and verify each copy (this is what runs automatically)
+  (no option)    run every USB job whose drive is mounted and verify each copy
+                 (this is what runs automatically). Afterwards NAS jobs run if
+                 NAS_UPLOAD is "ask" (you get a question) or "auto".
+  --nas          run the NAS jobs now, without asking. Combine with --dry-run
+                 or --verify-all to use those on the NAS jobs.
   --dry-run      show what would be copied, change nothing
-  --verify-all   read back the ENTIRE copy on the drive(s) and compare with
-                 stored checksums; damaged files are copied again
+  --verify-all   read back the ENTIRE copy and compare with stored checksums;
+                 damaged files are copied again
   --status       show progress of a running backup
-  --list         show configured jobs and whether their drives are mounted
+  --list         show configured jobs and whether their drives/NAS are available
   --help         this text
 
 Jobs are defined in $CONFIG_FILE
-Nothing is ever deleted from the drives.
+Nothing is ever deleted from the drives or the NAS.
 EOF
+}
+
+# Runs the NAS jobs. $1 = mode (sync/dry/verify), $2 = "ask" to ask before uploading.
+# Returns 0 when all went well (or there was nothing to do), 1 otherwise.
+run_nas_jobs() {
+    local mode="$1" ask="$2" i url mp rc overall=0 n=0 files=0 bytes=0 runnable=" "
+    local unreachable=$'\n' failed_mount=$'\n'
+
+    for ((i = 0; i < JOB_COUNT; i++)); do
+        [ "${JOB_NET[$i]}" = 1 ] || continue
+        n=$((n + 1))
+        url="${JOB_VOL[$i]}"; set_job "$i"
+        case "$unreachable$failed_mount" in *$'\n'"$url"$'\n'*) continue ;; esac
+
+        mp=$(net_find_mount "$url")
+        if [ -z "$mp" ]; then
+            if ! reachable "$url"; then
+                log "[$JOB_LABEL] NAS not reachable - skipped this time."
+                unreachable="$unreachable$url"$'\n'; continue
+            fi
+            if ! mp=$(net_mount "$url"); then
+                log "[$JOB_LABEL] ERROR: could not mount $url (is the password saved in the keychain?)"
+                failed_mount="$failed_mount$url"$'\n'; overall=1; continue
+            fi
+            NAS_MOUNTED_BY_US="$NAS_MOUNTED_BY_US$mp"$'\n'
+        fi
+        JOB_MP[i]="$mp"; set_job "$i"
+        runnable="$runnable$i "
+
+        # Plan now, so the question can say how much will be uploaded
+        if [ "$ask" = "ask" ] && [ "$mode" = "sync" ] && [ -d "$SRC" ]; then
+            JW="$WORK/job$i"; mkdir -p "$JW"
+            if plan_job; then files=$((files + PLAN_FILES)); bytes=$((bytes + PLAN_BYTES)); fi
+        fi
+    done
+
+    [ "$n" -gt 0 ] || { [ -t 1 ] && echo "No NAS jobs configured."; return 0; }
+    if [ "$runnable" = " " ]; then
+        local why="not reachable"; [ "$failed_mount" != $'\n' ] && why="could not be mounted"
+        notify "$APP" "NAS $why - skipped. Run with --nas later."
+        net_unmount_ours
+        return $overall
+    fi
+
+    if [ "$ask" = "ask" ] && [ "$mode" = "sync" ]; then
+        if [ "$files" -eq 0 ]; then
+            log "NAS: everything is already up to date."
+            net_unmount_ours
+            return $overall
+        fi
+        if ! ask_upload "Upload $files files ($(human "$bytes")) to the NAS now?"; then
+            log "NAS: upload of $files files ($(human "$bytes")) skipped (not now). Run 'raw-backup.sh --nas' later."
+            net_unmount_ours
+            return $overall
+        fi
+    fi
+
+    for ((i = 0; i < JOB_COUNT; i++)); do
+        case "$runnable" in *" $i "*) ;; *) continue ;; esac
+        set_job "$i"
+        run_job "$mode"; rc=$?
+        [ $rc -eq 0 ] || overall=1
+    done
+    net_unmount_ours
+    return $overall
 }
 
 # ---------------------------------------------------------------- main
 
 main() {
-    local mode="sync"
-    case "${1:-}" in
-        "")            mode="sync" ;;
-        --dry-run|-n)  mode="dry" ;;
-        --verify-all)  mode="verify" ;;
-        --status)      show_status; exit 0 ;;
-        --list)        load_jobs; list_jobs; exit 0 ;;
-        -h|--help)     usage; exit 0 ;;
-        *)             echo "Unknown option: $1" >&2; usage; exit 64 ;;
-    esac
+    local mode="sync" target="usb" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --nas)         target="nas" ;;
+            --dry-run|-n)  mode="dry" ;;
+            --verify-all)  mode="verify" ;;
+            --status)      show_status; exit 0 ;;
+            --list)        load_jobs; list_jobs; exit 0 ;;
+            -h|--help)     usage; exit 0 ;;
+            *)             echo "Unknown option: $arg" >&2; usage; exit 64 ;;
+        esac
+    done
 
     load_jobs
 
-    # launchd starts the script on EVERY mount - exit quietly if none of our drives is there
     local i any=false
-    for ((i = 0; i < JOB_COUNT; i++)); do
-        is_mounted "$VOLUMES_ROOT/${JOB_VOL[$i]}" && { any=true; break; }
-    done
-    if [ "$any" = false ]; then
-        [ -t 1 ] && echo "None of the configured drives is mounted. (raw-backup.sh --list shows the jobs.)"
-        exit 0
+    if [ "$target" = "usb" ]; then
+        # launchd starts the script on EVERY mount - exit quietly if none of our drives is there
+        for ((i = 0; i < JOB_COUNT; i++)); do
+            [ "${JOB_NET[$i]}" = 1 ] && continue
+            is_mounted "$VOLUMES_ROOT/${JOB_VOL[$i]}" && { any=true; break; }
+        done
+        if [ "$any" = false ]; then
+            [ -t 1 ] && echo "None of the configured drives is mounted. (raw-backup.sh --list shows the jobs.)"
+            exit 0
+        fi
     fi
 
     if [ "$mode" != "dry" ]; then
         acquire_lock || { log "Another run is already in progress - exiting."; exit 0; }
     fi
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/raw-backup.XXXXXX")
-    trap cleanup EXIT
+    trap 'net_unmount_ours; cleanup' EXIT
+
+    if [ "$target" = "nas" ]; then
+        run_nas_jobs "$mode" "no-ask"; exit $?
+    fi
 
     # Run every job whose drive is mounted. Repeat until no new drive has appeared,
     # so a drive plugged in while another is being backed up is not missed.
@@ -579,6 +791,7 @@ main() {
     while :; do
         ran=false
         for ((i = 0; i < JOB_COUNT; i++)); do
+            [ "${JOB_NET[$i]}" = 1 ] && continue
             case "$done_list" in *" $i "*) continue ;; esac
             set_job "$i"
             is_mounted || continue
@@ -590,13 +803,21 @@ main() {
         [ "$ran" = true ] && [ "$mode" != "dry" ] || break
     done
 
+    # The USB drives are done - eject them before the (possibly slow) NAS upload
     if [ "$mode" = "sync" ] && [ "$EJECT_WHEN_DONE" = "true" ] && command -v diskutil >/dev/null; then
         sync
-        printf '%s' "$ok_vols" | sort -u | while IFS= read -r v; do
+        while IFS= read -r v; do
             [ -n "$v" ] || continue
             case "$bad_vols" in *$'\n'"$v"$'\n'*) continue ;; esac
             is_mounted "$v" && diskutil eject "$v" >/dev/null 2>&1 && log "Ejected $v."
-        done
+        done < <(printf '%s' "$ok_vols" | sort -u)
+    fi
+
+    if [ "$mode" = "sync" ]; then
+        case "$NAS_UPLOAD" in
+            ask)  run_nas_jobs sync ask    || overall=1 ;;
+            auto) run_nas_jobs sync no-ask || overall=1 ;;
+        esac
     fi
     exit $overall
 }

@@ -1,6 +1,6 @@
 # raw-backup
 
-Verified, incremental backup of folders to USB drives on macOS. Plug in a drive and the backup starts by itself; every copied file is checked with SHA-256 against the original. Think of it as a small, free alternative to ChronoSync's "copy + verify" for external drives.
+Verified, incremental backup of folders to USB drives – and optionally a NAS – on macOS. Plug in a drive and the backup starts by itself; every copied file is checked with SHA-256 against the original. Think of it as a small, free alternative to ChronoSync's "copy + verify" for external drives.
 
 ## Features
 
@@ -10,10 +10,11 @@ Verified, incremental backup of folders to USB drives on macOS. Plug in a drive 
 4. **Verifies every copied file** – the SHA-256 of original and copy must match, otherwise the file is copied again. Files are written under a temporary name and renamed only when complete, so pulling the drive never leaves half-written files.
 5. **Keeps checksums on the drive** (`.raw-backup/jobs/<folder>/manifest.sha256`).
 6. **Full check every 30 days** – reads back the entire copy and compares it with the stored checksums. Damaged files are copied again from the original.
-7. **Progress bar** with percentage, speed and time remaining. In the background you get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
-8. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
+7. **Optional NAS upload** – after the USB backup, the same folders can go to a NAS share (SMB/AFP). By default you are asked first, with the size of the upload, so you can say "Not now" on a slow connection. An unreachable NAS is skipped quietly.
+8. **Progress bar** with percentage, speed and time remaining. In the background you get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
+9. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
 
-The script **never deletes** anything on the drives. Files you delete from a source folder stay on the drive.
+The script **never deletes** anything on the drives or the NAS. Files you delete from a source folder stay on the drive.
 
 ## Installation
 
@@ -64,6 +65,33 @@ Check your jobs and which drives are connected:
 ~/Library/Scripts/raw-backup.sh --list
 ```
 
+### NAS jobs
+
+A NAS share is written as `smb://server/share` in the drive column:
+
+```bash
+JOBS='
+~/WORK/Raw   | USB_1TB                    | Raw
+~/WORK/Raw   | smb://hemmanas.local/backup | Photos/Raw
+'
+```
+
+- Connect to the share once in Finder (**Go → Connect to Server**) and tick **Remember this password in my keychain**. The script mounts the share itself when needed, using the saved password, and unmounts it again afterwards. A share you have mounted yourself is used and left mounted.
+- Subfolders go in the third column, not in the address.
+- NAS jobs run **after** the USB jobs, so the USB drive is done (and ejected, if `EJECT_WHEN_DONE=true`) before a slow upload starts. They copy from the Mac's source folder, not from the USB drive.
+- `NAS_UPLOAD` decides what happens after a USB backup:
+
+| `NAS_UPLOAD` | |
+|---|---|
+| `ask` (default) | A dialog asks *"Upload 140 files (3.2 GB) to the NAS now?"*. No answer within `NAS_ASK_TIMEOUT` seconds counts as *Not now*. If nothing has changed, you are not asked. |
+| `auto` | Upload without asking whenever the NAS can be reached. |
+| `off` | Never automatically. Upload when it suits you with `raw-backup.sh --nas`. |
+
+- If the NAS cannot be reached (e.g. you are away from home), it is skipped in a few seconds and you get a notification.
+- If the connection drops mid-upload, the run stops and continues next time. Files already uploaded and verified are not uploaded again.
+- The full read-back check is off for NAS jobs by default (`NAS_FULL_VERIFY_DAYS=0`), since it downloads the whole copy. Run it yourself on a good connection: `raw-backup.sh --nas --verify-all`.
+- Synology's `@eaDir` and `#recycle` folders are ignored.
+
 Other settings:
 
 | Setting | Default | |
@@ -71,6 +99,9 @@ Other settings:
 | `FULL_VERIFY_DAYS` | `30` | Full check every N days per job, `0` = off |
 | `EJECT_WHEN_DONE` | `false` | Eject the drive when all its jobs succeeded |
 | `NOTIFY` | `true` | macOS notifications |
+| `NAS_UPLOAD` | `ask` | NAS jobs after a USB backup: `ask`, `auto` or `off` |
+| `NAS_ASK_TIMEOUT` | `120` | Seconds to wait for an answer before skipping the NAS |
+| `NAS_FULL_VERIFY_DAYS` | `0` | Full check of NAS copies every N days, `0` = only manually |
 
 ## Usage
 
@@ -80,7 +111,10 @@ Other settings:
 | `raw-backup.sh --dry-run` | Show what would be copied |
 | `raw-backup.sh --verify-all` | Full check of the copies now, repairing damaged files |
 | `raw-backup.sh --status` | Show progress of a running backup |
-| `raw-backup.sh --list` | Show configured jobs and whether their drives are mounted |
+| `raw-backup.sh --list` | Show configured jobs and whether their drives / NAS are available |
+| `raw-backup.sh --nas` | Upload to the NAS now, without asking |
+| `raw-backup.sh --nas --dry-run` | Show what would be uploaded to the NAS |
+| `raw-backup.sh --nas --verify-all` | Full check of the NAS copies |
 
 The script is installed in `~/Library/Scripts/`. Run in Terminal, it shows a live progress line:
 
@@ -91,6 +125,7 @@ The script is installed in `~/Library/Scripts/`. Run in Terminal, it shows a liv
 ## Good to know
 
 - **Wait for the "done" notification** before pulling the drive. If you pull it mid-run, the run stops safely and continues next time.
+- **With NAS jobs** you can pull the USB drive as soon as its "done" notification appears – the NAS upload reads from the Mac, not from the drive.
 - **The check right after copying** may in some cases read the copy from the macOS memory cache rather than from the drive. The periodic full check runs right after the drive is plugged in and reads from the drive itself – that is the one that catches damage that happens on the drive over time.
 - **The full check takes time** – roughly as long as reading the whole copy (500 GB on a cheap USB stick can take an hour or more).
 - **Drives are recognised by name.** Two drives with the same name are treated as the same drive.

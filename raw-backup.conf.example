@@ -7,7 +7,8 @@
 #     source folder  |  drive name  |  folder on the drive
 #
 #   source folder        the folder to back up (~ means your home folder)
-#   drive name           the USB drive's name as shown in Finder
+#   drive name           the USB drive's name as shown in Finder,
+#                        or a NAS share: smb://server/share
 #   folder on the drive  where the copy goes; leave it out to use the source
 #                        folder's name, or use . for the top level of the drive
 #
@@ -19,6 +20,7 @@ JOBS='
 ~/Pictures/Raw      | USB_1TB   | Raw
 # ~/Documents/Work  | USB_1TB   | Work
 # ~/Pictures/Raw    | BACKUP_2  | Raw
+# ~/Pictures/Raw    | smb://mynas.local/backup | Photos/Raw
 '
 
 # Read back the entire copy and compare checksums every N days, per job.
@@ -30,3 +32,22 @@ EJECT_WHEN_DONE=false
 
 # Show macOS notifications
 NOTIFY=true
+
+# ---------------------------------------------------------------------------
+# NAS jobs (lines with smb://...) run after the USB backup:
+#   ask   show a question with the size of the upload - answer "Not now" on a
+#         slow connection (default)
+#   auto  upload without asking whenever the NAS can be reached
+#   off   never automatically - only when you run: raw-backup.sh --nas
+# If the NAS cannot be reached it is skipped quietly. Save the NAS password in
+# the keychain the first time you connect in Finder.
+# ---------------------------------------------------------------------------
+NAS_UPLOAD=ask
+
+# Seconds to wait for an answer. No answer = skip the NAS this time.
+NAS_ASK_TIMEOUT=120
+
+# Full read-back check of the NAS copies every N days. This reads the whole
+# copy over the network, so it is off by default (0); run it yourself with
+# raw-backup.sh --nas --verify-all
+NAS_FULL_VERIFY_DAYS=0
