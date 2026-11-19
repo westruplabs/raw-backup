@@ -21,6 +21,7 @@ JOBS=""                     # one job per line: source folder | volume name | fo
 FULL_VERIFY_DAYS=30         # full read-back check every N days per job (0 = never automatically)
 EJECT_WHEN_DONE=false       # eject the drive(s) when everything succeeded
 NOTIFY=true                 # macOS notifications
+MIRROR_MAX_DELETE_PERCENT=20  # mirror jobs: ask before deleting more than this share of the copy
 PROGRESS_WINDOW=true        # open a Terminal window with live progress when a background run has work to do
 LOG_FILE="$HOME/Library/Logs/raw-backup.log"
 MTIME_TOLERANCE=2           # seconds (FAT/exFAT store timestamps coarsely)
@@ -57,7 +58,7 @@ if [ "$OS" = "Darwin" ]; then CP_OPTS="-X"; else CP_OPTS=""; fi
 # Parsed jobs (indexed arrays work in bash 3.2)
 JOB_COUNT=0
 JOB_SRC=(); JOB_VOL=(); JOB_DIR=()
-JOB_NET=(); JOB_MP=()       # NAS jobs: 1 / mount point once mounted
+JOB_NET=(); JOB_MP=(); JOB_MIRROR=()       # NAS jobs: 1 / mount point once mounted
 NAS_MOUNTED_BY_US=$'\n'     # shares this run mounted itself (unmounted again at the end)
 JOB_IS_NET=0
 
@@ -66,7 +67,7 @@ JOB_IDX=0; JOB_LABEL=""
 VOLUME=""; DEST=""; META_ROOT=""; META=""; MANIFEST=""; LAST_VERIFY_FILE=""; HISTORY=""
 
 WORK=""; JW=""
-FAILED=0; COPIED=0; COPIED_BYTES=0; NEW_HASHES=""
+FAILED=0; COPIED=0; COPIED_BYTES=0; NEW_HASHES=""; DELETED=0; DELETED_BYTES=0
 
 # Progress
 PROG_LABEL=""; PROG_TOTAL_FILES=0; PROG_TOTAL_BYTES=0; PROG_DONE_FILES=0; PROG_DONE_BYTES=0
@@ -218,8 +219,11 @@ net_unmount_ours() {
 
 # Asks whether to upload now. Terminal: y/N prompt. Background: a dialog.
 # No answer within NAS_ASK_TIMEOUT counts as "not now".
-ask_upload() {  # $1 = question
-    local ans
+ask_upload() { ask_choice "$1" "Not now" "Upload"; }
+
+# $1 = question, $2 = "no" button (default on timeout), $3 = "yes" button
+ask_choice() {
+    local ans no="$2" yes="$3"
     if [ -t 0 ] && [ -t 1 ]; then
         printf '\r\033[K%s [y/N] ' "$1"
         read -r -t "$NAS_ASK_TIMEOUT" ans || { echo; return 1; }
@@ -228,8 +232,8 @@ ask_upload() {  # $1 = question
     fi
     command -v osascript >/dev/null 2>&1 || return 1
     local q="${1//\"/\'}"
-    ans=$(osascript -e "display dialog \"$q\" with title \"$APP\" buttons {\"Not now\", \"Upload\"} default button \"Upload\" cancel button \"Not now\" with icon note giving up after $NAS_ASK_TIMEOUT" 2>/dev/null) || return 1
-    case "$ans" in *"gave up:true"*) return 1 ;; *"button returned:Upload"*) return 0 ;; esac
+    ans=$(osascript -e "display dialog \"$q\" with title \"$APP\" buttons {\"$no\", \"$yes\"} default button \"$yes\" cancel button \"$no\" with icon note giving up after $NAS_ASK_TIMEOUT" 2>/dev/null) || return 1
+    case "$ans" in *"gave up:true"*) return 1 ;; *"button returned:$yes"*) return 0 ;; esac
     return 1
 }
 
@@ -253,7 +257,7 @@ load_jobs() {
         case "$line" in *"|"*) ;; *) config_error "job line needs 'source | volume | folder': $line" ;; esac
         s=$(trim "${line%%|*}"); line="${line#*|}"
         if [ "${line#*|}" != "$line" ]; then
-            v=$(trim "${line%%|*}"); d=$(trim "${line#*|}")
+            v=$(trim "${line%%|*}"); d="${line#*|}"
         else
             v=$(trim "$line"); d=""
         fi
@@ -269,6 +273,14 @@ load_jobs() {
             case "$v" in */*) config_error "volume name must be the drive name, not a path: $v" ;; esac
             JOB_NET[n]=0
         fi
+        local opt=""
+        case "$d" in *"|"*) opt=$(trim "${d#*|}"); d="${d%%|*}" ;; esac
+        d=$(trim "$d")
+        case "$(printf '%s' "$opt" | tr '[:upper:]' '[:lower:]')" in
+            ""|keep) JOB_MIRROR[n]=0 ;;
+            mirror)  JOB_MIRROR[n]=1 ;;
+            *) config_error "the fourth column must be 'mirror' or 'keep': $opt" ;;
+        esac
         [ -n "$d" ] || d=$(basename "$s")
         d="${d#/}"; d="${d%/}"; [ -n "$d" ] || d="."
         case "/$d/" in */../*) config_error "folder on volume may not contain '..': $d" ;; esac
@@ -318,7 +330,8 @@ list_jobs() {
             elif reachable "${JOB_VOL[$i]}"; then m="NAS, reachable"
             else m="NAS, not reachable"; fi
         elif is_mounted; then m="yes"; else m="no"; fi
-        printf '%-3s %-40s %-16s %-16s %s\n' "$((i + 1))" "$SRC" "$VOLUME_NAME" "$DEST_SUBDIR" "$m"
+        local f="$DEST_SUBDIR"; [ "${JOB_MIRROR[$i]}" = 1 ] && f="$f (mirror)"
+        printf '%-3s %-40s %-16s %-16s %s\n' "$((i + 1))" "$SRC" "$VOLUME_NAME" "$f" "$m"
     done
     echo
     echo "NAS upload after USB backups: $NAS_UPLOAD"
@@ -597,6 +610,74 @@ plan_job() {
     PLAN_FILES=$(wc -l < "$JW/tocopy.lst" | tr -d ' ')
     PLAN_BYTES=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/tocopy.lst")
     log "[$JOB_LABEL] Source: $(wc -l < "$JW/src.lst" | tr -d ' ') files. To copy: $PLAN_FILES files ($(human "$PLAN_BYTES"))."
+
+    # Mirror jobs: files on the copy that are no longer in the source. Output: size<TAB>path
+    : > "$JW/todelete.lst"
+    if [ "${JOB_MIRROR[$JOB_IDX]}" = 1 ]; then
+        awk -F'\t' '
+            { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sub(/^\.\//, "", p) }
+            FILENAME == ARGV[1] { src[p] = 1; next }
+            !(p in src) { print $1 "\t" p }
+        ' "$JW/src.lst" "$JW/dst.lst" | sort -t "$(printf '\t')" -k2 > "$JW/todelete.lst"
+        [ -s "$JW/todelete.lst" ] && log "[$JOB_LABEL] Mirror: $(wc -l < "$JW/todelete.lst" | tr -d ' ') files on the copy are no longer in the source ($(human "$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/todelete.lst")"))."
+    fi
+    return 0
+}
+
+# Removes folders on the copy that no longer exist in the source, once they are empty
+# (apart from Finder's .DS_Store / ._ files).
+remove_gone_dirs() {
+    local dir
+    (cd "$DEST" && find . -mindepth 1 -type d 2>/dev/null) | { grep -Ev "$EXCLUDE_RE" || true; } \
+        | sed 's|^\./||' | sort -r | while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        [ -d "$SRC/$dir" ] && continue
+        find "$DEST/$dir" -maxdepth 1 -type f \( -name .DS_Store -o -name '._*' \) -delete 2>/dev/null
+        rmdir "$DEST/$dir" 2>/dev/null && log "    removed folder: $dir"
+    done
+    return 0
+}
+
+# Mirror jobs: delete files on the copy that are no longer in the source.
+# Safety: nothing is deleted if part of the source could not be read, and you are
+# asked first if more than MIRROR_MAX_DELETE_PERCENT % of the copy would go.
+mirror_delete() {
+    if [ -s "$JW/src.err" ]; then
+        log "[$JOB_LABEL] Mirror: part of the source could not be read - nothing deleted this time."
+        return 0
+    fi
+    if [ ! -s "$JW/todelete.lst" ]; then remove_gone_dirs; return 0; fi
+    local n bytes total pct sz rel
+    n=$(wc -l < "$JW/todelete.lst" | tr -d ' ')
+    bytes=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/todelete.lst")
+    total=$(wc -l < "$JW/dst.lst" | tr -d ' ')
+    pct=$(( total > 0 ? n * 100 / total : 100 ))
+    if [ "$pct" -gt "$MIRROR_MAX_DELETE_PERCENT" ]; then
+        status_note "Waiting for your answer: delete $n files from $VOLUME_NAME?"
+        if ! ask_choice "Delete $n files ($(human "$bytes")) from $VOLUME_NAME that are no longer in $(basename "$SRC")? That is $pct% of the copy." "Keep them" "Delete"; then
+            log "[$JOB_LABEL] Mirror: $n files ($pct% of the copy) NOT deleted - you chose to keep them (or did not answer)."
+            notify "$APP: $JOB_LABEL" "Kept $n files that are no longer in $(basename "$SRC") ($pct% of the copy)."
+            return 0
+        fi
+    fi
+    status_note "[$JOB_LABEL] Removing $n files that are no longer in the source..."
+    log "[$JOB_LABEL] Mirror: deleting $n files ($(human "$bytes")) that are no longer in the source:"
+    cut -f2 "$JW/todelete.lst" | sed 's/^/    - /' >> "$LOG_FILE"
+    : > "$JW/deleted.paths"
+    while IFS=$'\t' read -r -u 3 sz rel; do
+        [ -n "$rel" ] || continue
+        is_mounted || { log "ERROR: lost $VOLUME_NAME while deleting"; return 2; }
+        if rm -f -- "$DEST/$rel" 2>>"$LOG_FILE" && [ ! -e "$DEST/$rel" ]; then
+            DELETED=$((DELETED + 1)); DELETED_BYTES=$((DELETED_BYTES + sz))
+            printf '%s\n' "$rel" >> "$JW/deleted.paths"
+        fi
+    done 3< "$JW/todelete.lst"
+    # Forget their checksums
+    if [ -s "$JW/deleted.paths" ] && [ -f "$MANIFEST" ]; then
+        awk 'FILENAME == ARGV[1] { d[$0] = 1; next } !(substr($0, 67) in d)' "$JW/deleted.paths" "$MANIFEST" > "$JW/manifest.mirror" \
+            && cp "$JW/manifest.mirror" "$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"
+    fi
+    remove_gone_dirs
     return 0
 }
 
@@ -614,7 +695,15 @@ do_sync() {
     if [ "$dry" = "true" ]; then
         [ -t 1 ] || echo "[$JOB_LABEL] $n files to copy ($(human "$need_bytes")):"
         cut -f2 "$JW/tocopy.lst" | sed 's/^/    /'
+        if [ -s "$JW/todelete.lst" ]; then
+            echo "[$JOB_LABEL] Mirror - would delete $(wc -l < "$JW/todelete.lst" | tr -d ' ') files no longer in the source:"
+            cut -f2 "$JW/todelete.lst" | sed 's/^/    - /'
+        fi
         return 0
+    fi
+    if [ "${JOB_MIRROR[$JOB_IDX]}" = 1 ]; then
+        mirror_delete; local mrc=$?
+        [ $mrc -eq 2 ] && return 2
     fi
     [ "$n" -gt 0 ] || { log "[$JOB_LABEL] Everything is up to date."; return 0; }
 
@@ -804,7 +893,7 @@ verify_due() {
 # Runs one job in the given mode. Returns 0 ok, 1 error, 2 drive disconnected.
 run_job() {
     local mode="$1" start=$SECONDS rc=0 did_verify=false
-    FAILED=0; COPIED=0; COPIED_BYTES=0
+    FAILED=0; COPIED=0; COPIED_BYTES=0; DELETED=0; DELETED_BYTES=0
     JW="$WORK/job$JOB_IDX"; mkdir -p "$JW"
     [ "$mode" = "sync" ] || rm -f "$JW/tocopy.lst"
     NEW_HASHES="$JW/new.sha256"; : > "$NEW_HASHES"
@@ -844,6 +933,7 @@ run_job() {
     else
         summary="$COPIED files ($(human "$COPIED_BYTES")) copied and verified in $((secs / 60)) min $((secs % 60)) s."
     fi
+    [ "$DELETED" -gt 0 ] && summary="$summary $DELETED files ($(human "$DELETED_BYTES")) no longer in the source were deleted (mirror)."
     [ "$did_verify" = true ] && summary="$summary Full check done."
 
     if [ $rc -eq 2 ]; then
@@ -885,7 +975,7 @@ Usage: raw-backup.sh [--nas] [option]
   --help         this text
 
 Jobs are defined in $CONFIG_FILE
-Nothing is ever deleted from the drives or the NAS.
+Nothing is deleted from a drive or NAS unless its job is marked 'mirror'.
 EOF
 }
 

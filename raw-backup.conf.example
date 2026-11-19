@@ -4,13 +4,16 @@
 # ---------------------------------------------------------------------------
 # Backup jobs - one per line:
 #
-#     source folder  |  drive name  |  folder on the drive
+#     source folder  |  drive name  |  folder on the drive  |  mirror (optional)
 #
 #   source folder        the folder to back up (~ means your home folder)
 #   drive name           the USB drive's name as shown in Finder,
 #                        or a NAS share: smb://server/share
 #   folder on the drive  where the copy goes; leave it out to use the source
 #                        folder's name, or use . for the top level of the drive
+#   mirror               optional: delete files on the copy that are no longer
+#                        in the source, so it does not fill up. Without it,
+#                        nothing is ever deleted.
 #
 # Several folders can go to the same drive, and the same folder can go to
 # several drives. Every job whose drive is plugged in runs automatically.
@@ -32,6 +35,9 @@ EJECT_WHEN_DONE=false
 
 # Show macOS notifications
 NOTIFY=true
+
+# Mirror jobs: ask before deleting more than this share (%) of the copy at once
+MIRROR_MAX_DELETE_PERCENT=20
 
 # Open a Terminal window with live progress when the backup (or NAS upload)
 # has something to copy. You can close it; the backup continues.

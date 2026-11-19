@@ -14,7 +14,7 @@ Verified, incremental backup of folders to USB drives – and optionally a NAS �
 8. **Progress window** – when a backup or NAS upload starts in the background, a Terminal window opens with live progress (percentage, speed, time left) and shows a summary when it is done. You can close it at any time; the backup continues. Without the window you get notifications at 25, 50 and 75 % instead (for jobs over 2 GB), and `--status` shows progress at any time.
 9. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
 
-The script **never deletes** anything on the drives or the NAS. Files you delete from a source folder stay on the drive.
+By default the script **never deletes** anything: files you delete from a source folder stay on the drive or NAS. Mark a job `mirror` and its copy follows the source exactly instead – see [Mirror jobs](#mirror-jobs).
 
 ## Installation
 
@@ -65,6 +65,24 @@ Check your jobs and which drives are connected:
 ~/Library/Scripts/raw-backup.sh --list
 ```
 
+### Mirror jobs
+
+Add `mirror` as a fourth column to make the copy an exact mirror of the source: files and folders you delete from the source are deleted from the copy too, so the drive does not fill up with old work.
+
+```bash
+JOBS='
+~/WORK/Raw | USB_1TB                   | Raw | mirror
+~/WORK/Raw | smb://peternas/RAW_backup | Raw
+'
+```
+
+Here the USB drive mirrors `Raw`, while the NAS keeps everything until you delete it yourself.
+
+- Deletions happen **before** copying, so the space is freed for the new files.
+- **Safety:** if part of the source folder cannot be read, nothing is deleted that time. If more than `MIRROR_MAX_DELETE_PERCENT` (default 20 %) of the copy would be deleted at once, you are asked first; no answer means nothing is deleted.
+- `--dry-run` lists what would be deleted. Every deleted file is listed in the log.
+- Folders that no longer exist in the source are removed once empty.
+
 ### NAS jobs
 
 A NAS share is written as `smb://server/share` in the drive column:
@@ -100,6 +118,7 @@ Other settings:
 | `FULL_VERIFY_DAYS` | `30` | Full check every N days per job, `0` = off |
 | `EJECT_WHEN_DONE` | `false` | Eject the drive when all its jobs succeeded |
 | `NOTIFY` | `true` | macOS notifications |
+| `MIRROR_MAX_DELETE_PERCENT` | `20` | Mirror jobs: ask before deleting more than this share of the copy |
 | `PROGRESS_WINDOW` | `true` | Open a Terminal window with live progress when there is something to copy |
 | `NAS_UPLOAD` | `ask` | NAS jobs after a USB backup: `ask`, `auto` or `off` |
 | `NAS_ASK_TIMEOUT` | `120` | Seconds to wait for an answer before skipping the NAS |
@@ -111,7 +130,7 @@ Other settings:
 | Command | What it does |
 |---|---|
 | `raw-backup.sh` | Run every job whose drive is mounted (this runs automatically) |
-| `raw-backup.sh --dry-run` | Show what would be copied |
+| `raw-backup.sh --dry-run` | Show what would be copied (and deleted, for mirror jobs) |
 | `raw-backup.sh --verify-all` | Full check of the copies now, repairing damaged files |
 | `raw-backup.sh --status` | Show progress of a running backup |
 | `raw-backup.sh --watch` | Live progress of a running backup (what the progress window shows) |
