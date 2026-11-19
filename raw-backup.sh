@@ -42,6 +42,11 @@ CONFIG_FILE="${RAW_BACKUP_CONFIG:-$HOME/.config/raw-backup.conf}"
 APP="Raw-backup"
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 PROGRESS_OPENED=0
+# Files uploaded to a NAS in fast mode and not yet checked (kept on this Mac)
+PENDING_DIR="$HOME/Library/Application Support/raw-backup/unchecked"
+PENDING_FILE=""
+FORCE_VERIFY=0
+PV_CHECKED=0; PV_BAD=0; PV_FIXED=0
 LOCK_DIR="/tmp/raw-backup-$(id -u).lock"
 STATUS_FILE="$HOME/Library/Logs/raw-backup.status"
 EXCLUDE_RE='/(\.DS_Store|\._[^/]*|\.Spotlight-V100|\.Trashes|\.fseventsd|\.TemporaryItems|\.DocumentRevisions-V100|\.raw-backup|@eaDir|#recycle)(/|$)'
@@ -296,6 +301,11 @@ set_job() {  # $1 = job index
     LAST_VERIFY_FILE="$META/last_full_verify"
     HISTORY="$META_ROOT/history.log"
     JOB_LABEL="$(basename "$SRC") → $VOLUME_NAME"
+    if [ "$JOB_IS_NET" = 1 ]; then
+        PENDING_FILE="$PENDING_DIR/$(printf '%s|%s' "${JOB_VOL[$1]}" "$DEST_SUBDIR" | shasum | cut -c1-16).lst"
+    else
+        PENDING_FILE=""
+    fi
 }
 
 list_jobs() {
@@ -378,7 +388,7 @@ progress_show() {
         PROG_LAST_WRITE=$SECONDS
     fi
     # Notifications at 25/50/75 % when running in the background
-    if [ ! -t 1 ] && [ "$PROG_TOTAL_BYTES" -ge "$MILESTONE_MIN_BYTES" ]; then
+    if [ ! -t 1 ] && [ "$PROGRESS_OPENED" != 1 ] && [ "$PROG_TOTAL_BYTES" -ge "$MILESTONE_MIN_BYTES" ]; then
         while [ "$PROG_NEXT_MILESTONE" -lt 100 ] && [ "$pct" -ge "$PROG_NEXT_MILESTONE" ]; do
             notify "$APP: $PROG_LABEL" "$short"
             PROG_NEXT_MILESTONE=$((PROG_NEXT_MILESTONE + 25))
@@ -464,14 +474,36 @@ watch_progress() {
     tail -n +"$((start_lines + 1))" "$LOG_FILE" 2>/dev/null \
         | grep -E 'copied and verified|uploaded in|up to date|ERROR|INTERRUPTED|skipped|not reachable|Mismatches|Repaired|Ejected|Stopped' \
         | grep -v '0 files (0 B) copied' | cut -c22- | sed 's/^/  /'
-    printf '\n  You can close this window.\n'
+    watch_offer_check
+}
+
+# At the end of the progress window: offer to check uploads made in fast mode.
+# Waits without a time limit, so you can press Y later on a better connection.
+watch_offer_check() {
+    local files bytes key
+    while :; do
+        IFS=$'\t' read -r files bytes <<< "$(bash "$SCRIPT_PATH" --pending 2>/dev/null)"
+        if ! [ "${files:-0}" -gt 0 ] 2>/dev/null; then
+            printf '\n  You can close this window.\n'; return 0
+        fi
+        printf '\n  %s uploaded files (%s) on the NAS have not been checked yet.\n' "$files" "$(human "${bytes:-0}")"
+        printf '  Checking reads them back from the NAS - best on a fast connection.\n\n'
+        printf '  Press Y to check now - or leave this window open and press Y later,\n'
+        printf '  when you are on a better connection. Any other key skips.\n'
+        printf '  (Any time later:  raw-backup.sh --nas --verify-new)\n\n'
+        read -r -s -n 1 key || return 0
+        case "$key" in
+            [yYjJ]) printf '\n'; bash "$SCRIPT_PATH" --nas --verify-new ;;
+            *) printf '  Not checked now. You can close this window.\n'; return 0 ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------- copy + verify
 
 # Copies one file via a temporary name, verifies with SHA-256, two attempts.
 copy_verified() {  # $1 = relative path
-    local rel="$1" s="$SRC/$1" d="$DEST/$1" dir tmp hs hd attempt size
+    local rel="$1" s="$SRC/$1" d="$DEST/$1" dir tmp hs hd attempt size fast=0
     dir=$(dirname "$d")
     tmp="$dir/.$(basename "$d")$PARTIAL_SUFFIX"
     if [ ! -f "$s" ]; then log "SKIPPED (no longer in source): $rel"; return 0; fi
@@ -483,7 +515,8 @@ copy_verified() {  # $1 = relative path
         # shellcheck disable=SC2086
         if cp $CP_OPTS "$s" "$tmp" 2>>"$LOG_FILE" && touch -r "$s" "$tmp" && mv -f "$tmp" "$d"; then
             hs=$(hash_of "$s")
-            if [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ]; then
+            if [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ] && [ "$FORCE_VERIFY" != 1 ]; then
+                fast=1
                 # Fast mode: no read-back over the network. Compare sizes only; the
                 # source checksum is saved so --nas --verify-all can check the copy later.
                 [ "$(file_size "$d")" = "$(file_size "$s")" ] && hd="$hs" || hd="size-mismatch"
@@ -492,6 +525,7 @@ copy_verified() {  # $1 = relative path
             fi
             if [ -n "$hs" ] && [ "$hs" = "$hd" ]; then
                 size=$(file_size "$d")
+                [ "$fast" = 1 ] && printf '%s\t%s\n' "$size" "$rel" >> "$PENDING_FILE"
                 COPIED=$((COPIED + 1))
                 COPIED_BYTES=$((COPIED_BYTES + size))
                 printf '%s  %s\n' "$hs" "$rel" >> "$NEW_HASHES"
@@ -679,6 +713,80 @@ do_verify_all() {
         fi
     fi
     date +%s > "$LAST_VERIFY_FILE"
+    if [ "$JOB_IS_NET" = 1 ] && [ "$FAILED" -eq 0 ]; then rm -f "$PENDING_FILE"; fi
+    return 0
+}
+
+# Prints the unchecked uploads of a pending file as "size<TAB>path", one per file
+pending_clean() {
+    [ -s "$1" ] || return 0
+    awk -F'\t' 'NF >= 2 { s[$2] = $1 } END { for (k in s) print s[k] "\t" k }' "$1"
+}
+
+# Prints "files<TAB>bytes" of unchecked uploads for all NAS jobs (no NAS access needed)
+pending_total() {
+    local i
+    for ((i = 0; i < JOB_COUNT; i++)); do
+        [ "${JOB_NET[$i]}" = 1 ] || continue
+        set_job "$i"; pending_clean "$PENDING_FILE"
+    done | awk -F'\t' '{ n++; s += $1 } END { printf "%d\t%.0f\n", n, s }'
+}
+
+# Rewrites the pending file without the paths listed in $JW/done.paths
+pending_finish() {
+    touch "$JW/done.paths"
+    awk -F'\t' 'FILENAME == ARGV[1] { d[$0] = 1; next } !($2 in d)' "$JW/done.paths" "$JW/pending.lst" > "$JW/pending.keep"
+    if [ -s "$JW/pending.keep" ]; then cp "$JW/pending.keep" "$PENDING_FILE"; else rm -f "$PENDING_FILE"; fi
+}
+
+# Checks only the files uploaded in fast mode that have not been checked yet:
+# reads each back from the NAS and compares with the saved checksum. Damaged files
+# are uploaded again, this time with a full check.
+do_verify_pending() {
+    PV_CHECKED=0; PV_BAD=0; PV_FIXED=0
+    pending_clean "$PENDING_FILE" | sort -t "$(printf '\t')" -k2 > "$JW/pending.lst"
+    local n bytes sz rel exp hd
+    n=$(grep -c . "$JW/pending.lst" || true)
+    if [ "$n" -eq 0 ]; then log "[$JOB_LABEL] No unchecked uploads."; rm -f "$PENDING_FILE"; return 0; fi
+    bytes=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$JW/pending.lst")
+    log "[$JOB_LABEL] Checking $n uploaded files ($(human "$bytes")) against checksums..."
+    touch "$MANIFEST"
+    awk -F'\t' 'FILENAME == ARGV[1] { h[substr($0, 67)] = substr($0, 1, 64); next }
+                { print $1 "\t" $2 "\t" (($2 in h) ? h[$2] : "-") }' "$MANIFEST" "$JW/pending.lst" > "$JW/pending.join"
+    : > "$JW/done.paths"; : > "$JW/bad.paths"
+    progress_start "Checking" "$n" "$bytes"
+    while IFS=$'\t' read -r -u 3 sz rel exp; do
+        if ! is_mounted; then
+            progress_end; log "ERROR: lost $VOLUME_NAME during the check"; pending_finish; return 2
+        fi
+        if [ ! -f "$DEST/$rel" ]; then
+            echo "$rel" >> "$JW/done.paths"          # no longer on the NAS - nothing to check
+        else
+            [ "$exp" != "-" ] || exp=$(hash_of "$SRC/$rel")
+            hd=$(hash_of "$DEST/$rel")
+            if [ -n "$hd" ] && [ "$hd" = "$exp" ]; then echo "$rel" >> "$JW/done.paths"
+            else echo "$rel" >> "$JW/bad.paths"; fi
+        fi
+        PV_CHECKED=$((PV_CHECKED + 1))
+        progress_add "$sz"
+    done 3< "$JW/pending.join"
+    progress_end
+
+    PV_BAD=$(grep -c . "$JW/bad.paths" || true)
+    if [ "$PV_BAD" -gt 0 ]; then
+        log "Damaged on the NAS:"; sed 's/^/    /' "$JW/bad.paths" >> "$LOG_FILE"
+        local before=$FAILED rb rc
+        rb=$(while IFS= read -r rel; do file_size "$SRC/$rel"; done < "$JW/bad.paths" | awk '{ s += $1 } END { printf "%.0f", s }')
+        progress_start "Repairing" "$PV_BAD" "$rb"
+        FORCE_VERIFY=1; run_copy_list "$JW/bad.paths"; rc=$?; FORCE_VERIFY=0
+        awk '{ print substr($0, 67) }' "$NEW_HASHES" >> "$JW/done.paths"   # repaired + fully checked
+        merge_manifest
+        PV_FIXED=$((PV_BAD - (FAILED - before)))
+        pending_finish
+        [ $rc -eq 2 ] && return 2
+        return 0
+    fi
+    pending_finish
     return 0
 }
 
@@ -700,6 +808,7 @@ run_job() {
     JW="$WORK/job$JOB_IDX"; mkdir -p "$JW"
     [ "$mode" = "sync" ] || rm -f "$JW/tocopy.lst"
     NEW_HASHES="$JW/new.sha256"; : > "$NEW_HASHES"
+    [ "$JOB_IS_NET" = 1 ] && mkdir -p "$PENDING_DIR"
 
     if [ ! -d "$SRC" ]; then
         log "ERROR: source folder $SRC does not exist."
@@ -719,6 +828,7 @@ run_job() {
     status_note "[$JOB_LABEL] Preparing (comparing files)..."
     case "$mode" in
         verify) do_verify_all; rc=$?; did_verify=true ;;
+        verifynew) do_verify_pending; rc=$? ;;
         sync)
             do_sync false; rc=$?
             if [ $rc -eq 0 ] && verify_due; then do_verify_all; rc=$?; did_verify=true; fi
@@ -726,8 +836,11 @@ run_job() {
     esac
 
     local secs=$((SECONDS - start)) summary
-    if [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ] && [ "$mode" = "sync" ]; then
-        summary="$COPIED files ($(human "$COPIED_BYTES")) uploaded in $((secs / 60)) min $((secs % 60)) s (fast mode: check later with --nas --verify-all)."
+    if [ "$mode" = "verifynew" ]; then
+        if [ "$PV_BAD" -eq 0 ]; then summary="Checked $PV_CHECKED uploaded files: all OK ($((secs / 60)) min $((secs % 60)) s)."
+        else summary="Checked $PV_CHECKED uploaded files: $PV_BAD damaged, $PV_FIXED uploaded again and checked."; fi
+    elif [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ] && [ "$mode" = "sync" ]; then
+        summary="$COPIED files ($(human "$COPIED_BYTES")) uploaded in $((secs / 60)) min $((secs % 60)) s (not checked yet: run --nas --verify-new)."
     else
         summary="$COPIED files ($(human "$COPIED_BYTES")) copied and verified in $((secs / 60)) min $((secs % 60)) s."
     fi
@@ -764,6 +877,8 @@ Usage: raw-backup.sh [--nas] [option]
   --dry-run      show what would be copied, change nothing
   --verify-all   read back the ENTIRE copy and compare with stored checksums;
                  damaged files are copied again
+  --verify-new   check only the files uploaded to the NAS in fast mode that have
+                 not been checked yet (implies --nas)
   --status       show progress of a running backup
   --watch        show live progress of a running backup until it finishes
   --list         show configured jobs and whether their drives/NAS are available
@@ -780,11 +895,17 @@ run_nas_jobs() {
     local mode="$1" ask="$2" i url mp rc overall=0 n=0 files=0 bytes=0 runnable=" "
     local unreachable=$'\n' failed_mount=$'\n'
     status_note "Checking the NAS..."
+    if [ "$mode" = "verifynew" ]; then
+        local pf
+        pf=$(pending_total); pf="${pf%%$'\t'*}"
+        if [ "${pf:-0}" -eq 0 ]; then log "All uploads to the NAS are already checked."; return 0; fi
+    fi
 
     for ((i = 0; i < JOB_COUNT; i++)); do
         [ "${JOB_NET[$i]}" = 1 ] || continue
-        n=$((n + 1))
         url="${JOB_VOL[$i]}"; set_job "$i"
+        if [ "$mode" = "verifynew" ] && [ ! -s "$PENDING_FILE" ]; then continue; fi
+        n=$((n + 1))
         case "$unreachable$failed_mount" in *$'\n'"$url"$'\n'*) continue ;; esac
 
         mp=$(net_find_mount "$url")
@@ -850,6 +971,8 @@ main() {
             --nas)         target="nas" ;;
             --dry-run|-n)  mode="dry" ;;
             --verify-all)  mode="verify" ;;
+            --verify-new)  mode="verifynew"; target="nas" ;;
+            --pending)     load_jobs; pending_total; exit 0 ;;
             --status)      show_status; exit 0 ;;
             --watch)       watch_progress; exit 0 ;;
             --list)        load_jobs; list_jobs; exit 0 ;;

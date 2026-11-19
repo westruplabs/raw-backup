@@ -11,7 +11,7 @@ Verified, incremental backup of folders to USB drives – and optionally a NAS �
 5. **Keeps checksums on the drive** (`.raw-backup/jobs/<folder>/manifest.sha256`).
 6. **Full check every 30 days** – reads back the entire copy and compares it with the stored checksums. Damaged files are copied again from the original.
 7. **Optional NAS upload** – after the USB backup, the same folders can go to a NAS share (SMB/AFP). By default you are asked first, with the size of the upload, so you can say "Not now" on a slow connection. An unreachable NAS is skipped quietly.
-8. **Progress window** – when a backup or NAS upload starts in the background, a Terminal window opens with live progress (percentage, speed, time left) and shows a summary when it is done. You can close it at any time; the backup continues. You also get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
+8. **Progress window** – when a backup or NAS upload starts in the background, a Terminal window opens with live progress (percentage, speed, time left) and shows a summary when it is done. You can close it at any time; the backup continues. Without the window you get notifications at 25, 50 and 75 % instead (for jobs over 2 GB), and `--status` shows progress at any time.
 9. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
 
 The script **never deletes** anything on the drives or the NAS. Files you delete from a source folder stay on the drive.
@@ -89,7 +89,7 @@ JOBS='
 
 - If the NAS cannot be reached (e.g. you are away from home), it is skipped in a few seconds and you get a notification.
 - If the connection drops mid-upload, the run stops and continues next time. Files already uploaded and verified are not uploaded again.
-- **Fast mode:** set `NAS_VERIFY_AFTER_COPY=false` to skip reading each file back from the NAS right after uploading it. Over the internet this can almost halve the upload time. Only the file size is checked during upload, but the checksum of the original is still saved, so `raw-backup.sh --nas --verify-all` checks the NAS copy properly later and repairs damaged files. USB drives are always checked right after copying.
+- **Fast mode:** set `NAS_VERIFY_AFTER_COPY=false` to skip reading each file back from the NAS right after uploading it. Over the internet this can almost halve the upload time. Only the file size is checked during upload; the checksum of the original is saved and the file is remembered as *unchecked*. When the upload is done, the progress window offers to check the new files – press **Y** now, or leave the window open and press Y later when you are on a better connection. You can also run `raw-backup.sh --nas --verify-new` at any time. Damaged files are uploaded again. USB drives are always checked right after copying.
 - The full read-back check is off for NAS jobs by default (`NAS_FULL_VERIFY_DAYS=0`), since it downloads the whole copy. Run it yourself on a good connection: `raw-backup.sh --nas --verify-all`.
 - Synology's `@eaDir` and `#recycle` folders are ignored.
 
@@ -118,6 +118,7 @@ Other settings:
 | `raw-backup.sh --list` | Show configured jobs and whether their drives / NAS are available |
 | `raw-backup.sh --nas` | Upload to the NAS now, without asking |
 | `raw-backup.sh --nas --dry-run` | Show what would be uploaded to the NAS |
+| `raw-backup.sh --nas --verify-new` | Check only the NAS uploads made in fast mode that are not checked yet |
 | `raw-backup.sh --nas --verify-all` | Full check of the NAS copies |
 
 The script is installed in `~/Library/Scripts/`. Run in Terminal, it shows a live progress line:
