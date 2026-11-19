@@ -21,6 +21,7 @@ JOBS=""                     # one job per line: source folder | volume name | fo
 FULL_VERIFY_DAYS=30         # full read-back check every N days per job (0 = never automatically)
 EJECT_WHEN_DONE=false       # eject the drive(s) when everything succeeded
 NOTIFY=true                 # macOS notifications
+PROGRESS_WINDOW=true        # open a Terminal window with live progress when a background run has work to do
 LOG_FILE="$HOME/Library/Logs/raw-backup.log"
 MTIME_TOLERANCE=2           # seconds (FAT/exFAT store timestamps coarsely)
 VOLUMES_ROOT="/Volumes"
@@ -39,6 +40,8 @@ CONFIG_FILE="${RAW_BACKUP_CONFIG:-$HOME/.config/raw-backup.conf}"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 APP="Raw-backup"
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+PROGRESS_OPENED=0
 LOCK_DIR="/tmp/raw-backup-$(id -u).lock"
 STATUS_FILE="$HOME/Library/Logs/raw-backup.status"
 EXCLUDE_RE='/(\.DS_Store|\._[^/]*|\.Spotlight-V100|\.Trashes|\.fseventsd|\.TemporaryItems|\.DocumentRevisions-V100|\.raw-backup|@eaDir|#recycle)(/|$)'
@@ -358,18 +361,20 @@ progress_show() {
                 else eta = sprintf("about %d h %d min left", int(r / 3600), int((r - int(r / 3600) * 3600) / 60))
             } else eta = "estimating time..."
             speed = (rate > 0) ? h(rate) "/s" : "-"
-            printf "%d\t[%s] %3d%%  %s of %s  %s  %s  (%d/%d files)\t%d%% done, %s of %s. %s.",
-                int(pct), bar, pct, h(d), h(t), speed, eta, fd, ft, int(pct), h(d), h(t), eta
+            printf "%d\t[%s] %3d%%  %s of %s  %s  %s  (%d/%d files)\t%d%% done, %s of %s. %s.\t%s\t%s\t%s\t%s\t%s",
+                int(pct), bar, pct, h(d), h(t), speed, eta, fd, ft, int(pct), h(d), h(t), eta,
+                bar, h(d), h(t), speed, eta
         }')
-    pct="${out%%$'\t'*}"; out="${out#*$'\t'}"
-    long="${out%%$'\t'*}"; short="${out#*$'\t'}"
+    local bar dh th sp eta
+    IFS=$'\t' read -r pct long short bar dh th sp eta <<< "$out"
 
     if [ -t 1 ]; then
         printf '\r%s %s\033[K' "$PROG_LABEL" "$long"
     fi
     # Status file for 'raw-backup.sh --status' (at most every 2 seconds)
     if [ $((SECONDS - PROG_LAST_WRITE)) -ge 2 ] || [ "$PROG_DONE_FILES" -ge "$PROG_TOTAL_FILES" ]; then
-        { printf '%s %s\n' "$PROG_LABEL" "$long" > "$STATUS_FILE"; } 2>/dev/null
+        { printf 'P\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$PROG_LABEL" "$long" "$bar" "$pct" \
+              "$dh" "$th" "$sp" "$eta" "$PROG_DONE_FILES" "$PROG_TOTAL_FILES" > "$STATUS_FILE"; } 2>/dev/null
         PROG_LAST_WRITE=$SECONDS
     fi
     # Notifications at 25/50/75 % when running in the background
@@ -383,17 +388,83 @@ progress_show() {
 
 progress_end() { [ -t 1 ] && printf '\n'; return 0; }
 
-show_status() {
+# A one-line status message for --status and the progress window ("Preparing...", etc.)
+status_note() {
+    mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null
+    { printf 'N\t%s\n' "$1" > "$STATUS_FILE"; } 2>/dev/null
+}
+
+backup_running() {
     local pid
     pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+show_status() {
+    local pid kind a b
+    pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -f "$STATUS_FILE" ]; then
-        cat "$STATUS_FILE"
+        IFS=$'\t' read -r kind a b _ < "$STATUS_FILE"
+        if [ "$kind" = "P" ]; then echo "$a $b"; else echo "$a"; fi
     elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         echo "Backup running (preparing)..."
     else
         echo "No backup is running."
         [ -f "$LOG_FILE" ] && echo "Last: $(grep -v '^ ' "$LOG_FILE" | tail -1)"
     fi
+}
+
+# Opens a Terminal window that shows live progress (only for background runs).
+# Uses a .command file, so no extra macOS permission is needed.
+open_progress_window() {
+    [ "$PROGRESS_WINDOW" = "true" ] || return 0
+    [ "$PROGRESS_OPENED" = 1 ] && return 0
+    [ -t 1 ] && return 0                       # already running in a terminal
+    command -v open >/dev/null 2>&1 || return 0
+    PROGRESS_OPENED=1
+    local f="$HOME/Library/Application Support/raw-backup/Raw-backup progress.command"
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    printf '#!/bin/bash\nexec /bin/bash %q --watch\n' "$SCRIPT_PATH" > "$f" && chmod 755 "$f" || return 0
+    open -a Terminal "$f" >/dev/null 2>&1 &
+}
+
+# The progress window: redraws every second until the backup has finished,
+# then shows a summary of this run.
+watch_progress() {
+    local start_lines kind label long bar pct dh th sp eta fd ft
+    printf '\033]0;%s\007' "$APP"
+    start_lines=$( (wc -l < "$LOG_FILE") 2>/dev/null || echo 0 ); start_lines=${start_lines// /}
+    if ! backup_running; then
+        echo "No backup is running."
+        return 0
+    fi
+    while backup_running; do
+        printf '\033[H\033[J'
+        printf '%s – backup in progress\n\n' "$APP"
+        if [ -f "$STATUS_FILE" ] && IFS=$'\t' read -r kind label long bar pct dh th sp eta fd ft < "$STATUS_FILE"; then
+            if [ "$kind" = "P" ]; then
+                printf '  %s\n\n' "$label"
+                printf '  [%s] %s%%\n\n' "$bar" "$pct"
+                printf '  %s of %s\n' "$dh" "$th"
+                printf '  %s files of %s\n' "$fd" "$ft"
+                printf '  Speed: %s\n' "$sp"
+                printf '  Time:  %s\n' "$eta"
+            else
+                printf '  %s\n' "$label"
+            fi
+        else
+            printf '  Preparing...\n'
+        fi
+        printf '\n\n  You can close this window - the backup continues in the background.\n'
+        printf '  Wait for the "done" notification before unplugging the drive.\n'
+        sleep 1
+    done
+    printf '\033[H\033[J'
+    printf '%s – finished\n\n' "$APP"
+    tail -n +"$((start_lines + 1))" "$LOG_FILE" 2>/dev/null \
+        | grep -E 'copied and verified|uploaded in|up to date|ERROR|INTERRUPTED|skipped|not reachable|Mismatches|Repaired|Ejected|Stopped' \
+        | grep -v '0 files (0 B) copied' | cut -c22- | sed 's/^/  /'
+    printf '\n  You can close this window.\n'
 }
 
 # ---------------------------------------------------------------- copy + verify
@@ -521,6 +592,7 @@ do_sync() {
     fi
 
     notify "$APP: $JOB_LABEL" "Copying $n files ($(human "$need_bytes"))..."
+    open_progress_window
     cut -f2 "$JW/tocopy.lst" > "$JW/tocopy.paths"
     progress_start "Copying" "$n" "$need_bytes"
     run_copy_list "$JW/tocopy.paths"; local rc=$?
@@ -532,6 +604,7 @@ do_sync() {
 do_verify_all() {
     log "[$JOB_LABEL] Full check started (reading back the entire copy)..."
     notify "$APP: $JOB_LABEL" "Full check of the copy started..."
+    open_progress_window
     touch "$MANIFEST"
     list_files "$DEST" > "$JW/dst.lst"
     awk -F'\t' '{ p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sub(/^\.\//, "", p); print p }' "$JW/dst.lst" \
@@ -643,6 +716,7 @@ run_job() {
     find "$DEST" -name "*$PARTIAL_SUFFIX" -type f -delete 2>/dev/null
 
     log "=== Start ($mode): $SRC -> $DEST"
+    status_note "[$JOB_LABEL] Preparing (comparing files)..."
     case "$mode" in
         verify) do_verify_all; rc=$?; did_verify=true ;;
         sync)
@@ -691,6 +765,7 @@ Usage: raw-backup.sh [--nas] [option]
   --verify-all   read back the ENTIRE copy and compare with stored checksums;
                  damaged files are copied again
   --status       show progress of a running backup
+  --watch        show live progress of a running backup until it finishes
   --list         show configured jobs and whether their drives/NAS are available
   --help         this text
 
@@ -704,6 +779,7 @@ EOF
 run_nas_jobs() {
     local mode="$1" ask="$2" i url mp rc overall=0 n=0 files=0 bytes=0 runnable=" "
     local unreachable=$'\n' failed_mount=$'\n'
+    status_note "Checking the NAS..."
 
     for ((i = 0; i < JOB_COUNT; i++)); do
         [ "${JOB_NET[$i]}" = 1 ] || continue
@@ -747,6 +823,7 @@ run_nas_jobs() {
             net_unmount_ours
             return $overall
         fi
+        status_note "Waiting for your answer: upload $files files ($(human "$bytes")) to the NAS?"
         if ! ask_upload "Upload $files files ($(human "$bytes")) to the NAS now?"; then
             log "NAS: upload of $files files ($(human "$bytes")) skipped (not now). Run 'raw-backup.sh --nas' later."
             net_unmount_ours
@@ -774,6 +851,7 @@ main() {
             --dry-run|-n)  mode="dry" ;;
             --verify-all)  mode="verify" ;;
             --status)      show_status; exit 0 ;;
+            --watch)       watch_progress; exit 0 ;;
             --list)        load_jobs; list_jobs; exit 0 ;;
             -h|--help)     usage; exit 0 ;;
             *)             echo "Unknown option: $arg" >&2; usage; exit 64 ;;

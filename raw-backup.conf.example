@@ -33,6 +33,10 @@ EJECT_WHEN_DONE=false
 # Show macOS notifications
 NOTIFY=true
 
+# Open a Terminal window with live progress when the backup (or NAS upload)
+# has something to copy. You can close it; the backup continues.
+PROGRESS_WINDOW=true
+
 # ---------------------------------------------------------------------------
 # NAS jobs (lines with smb://...) run after the USB backup:
 #   ask   show a question with the size of the upload - answer "Not now" on a

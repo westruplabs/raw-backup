@@ -11,7 +11,7 @@ Verified, incremental backup of folders to USB drives – and optionally a NAS �
 5. **Keeps checksums on the drive** (`.raw-backup/jobs/<folder>/manifest.sha256`).
 6. **Full check every 30 days** – reads back the entire copy and compares it with the stored checksums. Damaged files are copied again from the original.
 7. **Optional NAS upload** – after the USB backup, the same folders can go to a NAS share (SMB/AFP). By default you are asked first, with the size of the upload, so you can say "Not now" on a slow connection. An unreachable NAS is skipped quietly.
-8. **Progress bar** with percentage, speed and time remaining. In the background you get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
+8. **Progress window** – when a backup or NAS upload starts in the background, a Terminal window opens with live progress (percentage, speed, time left) and shows a summary when it is done. You can close it at any time; the backup continues. You also get notifications at 25, 50 and 75 % (for jobs over 2 GB), and `--status` shows progress at any time.
 9. **Notifications** when a backup is done or something went wrong. Log in `~/Library/Logs/raw-backup.log`.
 
 The script **never deletes** anything on the drives or the NAS. Files you delete from a source folder stay on the drive.
@@ -100,6 +100,7 @@ Other settings:
 | `FULL_VERIFY_DAYS` | `30` | Full check every N days per job, `0` = off |
 | `EJECT_WHEN_DONE` | `false` | Eject the drive when all its jobs succeeded |
 | `NOTIFY` | `true` | macOS notifications |
+| `PROGRESS_WINDOW` | `true` | Open a Terminal window with live progress when there is something to copy |
 | `NAS_UPLOAD` | `ask` | NAS jobs after a USB backup: `ask`, `auto` or `off` |
 | `NAS_ASK_TIMEOUT` | `120` | Seconds to wait for an answer before skipping the NAS |
 | `NAS_FULL_VERIFY_DAYS` | `0` | Full check of NAS copies every N days, `0` = only manually |
@@ -113,6 +114,7 @@ Other settings:
 | `raw-backup.sh --dry-run` | Show what would be copied |
 | `raw-backup.sh --verify-all` | Full check of the copies now, repairing damaged files |
 | `raw-backup.sh --status` | Show progress of a running backup |
+| `raw-backup.sh --watch` | Live progress of a running backup (what the progress window shows) |
 | `raw-backup.sh --list` | Show configured jobs and whether their drives / NAS are available |
 | `raw-backup.sh --nas` | Upload to the NAS now, without asking |
 | `raw-backup.sh --nas --dry-run` | Show what would be uploaded to the NAS |
