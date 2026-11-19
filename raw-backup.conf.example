@@ -51,3 +51,11 @@ NAS_ASK_TIMEOUT=120
 # copy over the network, so it is off by default (0); run it yourself with
 # raw-backup.sh --nas --verify-all
 NAS_FULL_VERIFY_DAYS=0
+
+# Read each file back from the NAS right after uploading it, to check it.
+# Over the internet this can almost double the upload time. With false, only
+# the size is checked during upload; the checksum of the original is still
+# saved, so raw-backup.sh --nas --verify-all checks the NAS copy properly
+# whenever you run it (preferably on a fast connection).
+# USB drives are always checked right after copying.
+NAS_VERIFY_AFTER_COPY=true

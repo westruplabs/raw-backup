@@ -89,6 +89,7 @@ JOBS='
 
 - If the NAS cannot be reached (e.g. you are away from home), it is skipped in a few seconds and you get a notification.
 - If the connection drops mid-upload, the run stops and continues next time. Files already uploaded and verified are not uploaded again.
+- **Fast mode:** set `NAS_VERIFY_AFTER_COPY=false` to skip reading each file back from the NAS right after uploading it. Over the internet this can almost halve the upload time. Only the file size is checked during upload, but the checksum of the original is still saved, so `raw-backup.sh --nas --verify-all` checks the NAS copy properly later and repairs damaged files. USB drives are always checked right after copying.
 - The full read-back check is off for NAS jobs by default (`NAS_FULL_VERIFY_DAYS=0`), since it downloads the whole copy. Run it yourself on a good connection: `raw-backup.sh --nas --verify-all`.
 - Synology's `@eaDir` and `#recycle` folders are ignored.
 
@@ -102,6 +103,7 @@ Other settings:
 | `NAS_UPLOAD` | `ask` | NAS jobs after a USB backup: `ask`, `auto` or `off` |
 | `NAS_ASK_TIMEOUT` | `120` | Seconds to wait for an answer before skipping the NAS |
 | `NAS_FULL_VERIFY_DAYS` | `0` | Full check of NAS copies every N days, `0` = only manually |
+| `NAS_VERIFY_AFTER_COPY` | `true` | Read each file back from the NAS after upload; `false` = faster |
 
 ## Usage
 

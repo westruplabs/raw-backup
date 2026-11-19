@@ -28,6 +28,8 @@ NAS_UPLOAD=ask              # NAS jobs after a USB backup: ask | auto | off  (of
 NAS_ASK_TIMEOUT=120         # seconds to wait for an answer; no answer = skip the NAS this time
 NAS_FULL_VERIFY_DAYS=0      # full read-back of NAS copies every N days (0 = only with --nas --verify-all)
 NAS_MOUNT_TIMEOUT=60        # seconds to wait for the NAS share to mount
+NAS_VERIFY_AFTER_COPY=true  # read each file back from the NAS after upload (false = faster;
+                            # checksums are still saved and checked by --nas --verify-all)
 # Legacy single-job settings (v1). Still honoured if JOBS is empty.
 SRC=""; VOLUME_NAME=""; DEST_SUBDIR=""
 # -----------------------------------------------------------------------
@@ -410,9 +412,15 @@ copy_verified() {  # $1 = relative path
         # shellcheck disable=SC2086
         if cp $CP_OPTS "$s" "$tmp" 2>>"$LOG_FILE" && touch -r "$s" "$tmp" && mv -f "$tmp" "$d"; then
             hs=$(hash_of "$s")
-            hd=$(hash_of "$d")
+            if [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ]; then
+                # Fast mode: no read-back over the network. Compare sizes only; the
+                # source checksum is saved so --nas --verify-all can check the copy later.
+                [ "$(file_size "$d")" = "$(file_size "$s")" ] && hd="$hs" || hd="size-mismatch"
+            else
+                hd=$(hash_of "$d")
+            fi
             if [ -n "$hs" ] && [ "$hs" = "$hd" ]; then
-                size=$(wc -c < "$d" | tr -d ' ')
+                size=$(file_size "$d")
                 COPIED=$((COPIED + 1))
                 COPIED_BYTES=$((COPIED_BYTES + size))
                 printf '%s  %s\n' "$hs" "$rel" >> "$NEW_HASHES"
@@ -644,7 +652,11 @@ run_job() {
     esac
 
     local secs=$((SECONDS - start)) summary
-    summary="$COPIED files ($(human "$COPIED_BYTES")) copied and verified in $((secs / 60)) min $((secs % 60)) s."
+    if [ "$JOB_IS_NET" = 1 ] && [ "$NAS_VERIFY_AFTER_COPY" != "true" ] && [ "$mode" = "sync" ]; then
+        summary="$COPIED files ($(human "$COPIED_BYTES")) uploaded in $((secs / 60)) min $((secs % 60)) s (fast mode: check later with --nas --verify-all)."
+    else
+        summary="$COPIED files ($(human "$COPIED_BYTES")) copied and verified in $((secs / 60)) min $((secs % 60)) s."
+    fi
     [ "$did_verify" = true ] && summary="$summary Full check done."
 
     if [ $rc -eq 2 ]; then
